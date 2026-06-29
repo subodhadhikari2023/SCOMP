@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  scomp:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./browser_profiles:/app/browser_profiles
+      - ./logs:/app/logs
+      - ./db:/app/db
+      - ./config:/app/config
+    stdin_open: true
+    tty: true
+    restart: "no"
