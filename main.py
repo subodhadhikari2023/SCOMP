@@ -61,17 +61,24 @@ def _check_first_boot() -> None:
     if lock.exists():
         return
     lock.touch()
+
+    if not sys.stdin.isatty():
+        return  # non-interactive context (piped, CI, Docker) — skip prompt silently
+
     console.print()
     console.rule("[bold cyan]S.C.O.M.P  —  First-Boot Setup[/bold cyan]")
     console.print(
         "\n  SCOMP can register itself to start automatically when your machine boots.\n"
     )
-    if Confirm.ask("  Enable auto-start on boot?", default=False):
-        _register_autostart()
-    else:
-        console.print(
-            "  [dim]Skipped. Run [bold]python main.py --setup[/bold] anytime to change this.[/dim]"
-        )
+    try:
+        if Confirm.ask("  Enable auto-start on boot?", default=False):
+            _register_autostart()
+        else:
+            console.print(
+                "  [dim]Skipped. Run [bold]python main.py --setup[/bold] anytime to change this.[/dim]"
+            )
+    except (EOFError, KeyboardInterrupt):
+        pass
     console.print()
 
 
