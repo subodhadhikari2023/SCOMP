@@ -18,6 +18,7 @@ Memory + persistence model:
 
 import asyncio
 import logging
+import random
 from urllib.parse import urlparse
 
 import httpx
@@ -28,6 +29,14 @@ from config import settings
 from db import database
 
 logger = logging.getLogger(__name__)
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
 
 _ENGINES = {
     "bing": {
@@ -181,6 +190,8 @@ async def discover_urls(run_id: int, seen_domains: set) -> list:
                 if len(all_entries) >= max_total:
                     break
 
+                # Rotate User-Agent per request to reduce rate-limit risk
+                client.headers.update({"User-Agent": random.choice(_USER_AGENTS)})
                 urls = await _fetch_page(client, engine_name, query, page)
 
                 for url in urls:
@@ -207,10 +218,13 @@ async def discover_urls(run_id: int, seen_domains: set) -> list:
                             len(all_entries), len(seen_domains),
                         )
 
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(random.uniform(1.5, 3.0))
 
             if len(all_entries) >= max_total:
                 break
+
+            # Longer pause between queries to avoid DDG rate-limiting
+            await asyncio.sleep(random.uniform(3.0, 6.0))
 
     # Final flush — clears any remainder that didn't hit the threshold
     _flush(flush_buffer, run_id)

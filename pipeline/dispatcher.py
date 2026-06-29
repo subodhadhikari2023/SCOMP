@@ -175,7 +175,7 @@ async def run_dispatch(progress_callback=None) -> dict:
         page: Page = await context.new_page()
 
         await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
-        if not await _wait_for_inbox(page):
+        if not await _wait_inbox_any_page(context):
             logger.error("Outlook session expired — run: python main.py --setup-sender")
             stats["halted"] = True
             await browser.close()
