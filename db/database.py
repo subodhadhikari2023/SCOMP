@@ -45,13 +45,13 @@ def get_conn(db_path: Optional[str] = None):
 
 def insert_lead(company: str, email: str, **kwargs) -> Optional[int]:
     fields = {"company": company, "email": email, **kwargs}
-    cols = ", ".join(fields.keys())
+    cols         = ", ".join(fields.keys())
     placeholders = ", ".join("?" for _ in fields)
-    values = list(fields.values())
     with get_conn() as conn:
         try:
             cur = conn.execute(
-                f"INSERT INTO leads ({cols}) VALUES ({placeholders})", values
+                f"INSERT INTO leads ({cols}) VALUES ({placeholders})",
+                list(fields.values()),
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -88,8 +88,7 @@ def count_leads_by_status() -> dict:
 def insert_email(lead_id: int, subject: str, body: str, word_count: int) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            """INSERT INTO emails (lead_id, subject, body, word_count)
-               VALUES (?, ?, ?, ?)""",
+            "INSERT INTO emails (lead_id, subject, body, word_count) VALUES (?, ?, ?, ?)",
             (lead_id, subject, body, word_count),
         )
         return cur.lastrowid
@@ -168,7 +167,7 @@ def get_today_run_summary() -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
-# ── Skipped Sites ─────────────────────────────────────────────────────────────
+# ── Skipped Sites (permanent) ──────────────────────────────────────────────────
 
 def add_skipped_site(domain: str, reason: str) -> None:
     with get_conn() as conn:
@@ -178,7 +177,7 @@ def add_skipped_site(domain: str, reason: str) -> None:
                 (domain, reason),
             )
         except sqlite3.IntegrityError:
-            pass  # already skipped
+            pass
 
 
 def is_site_skipped(domain: str) -> bool:
@@ -194,3 +193,100 @@ def get_skipped_sites() -> list:
         return conn.execute(
             "SELECT * FROM skipped_sites ORDER BY skipped_at DESC"
         ).fetchall()
+
+
+# ── Discovered URLs ────────────────────────────────────────────────────────────
+
+def load_seen_domains() -> set:
+    """
+    Returns an in-memory set of every domain ever processed.
+    Called once at run startup — all per-URL dedup during the run
+    uses this set directly (zero DB calls per URL).
+    Combines discovered_urls + skipped_sites to cover all history.
+    """
+    with get_conn() as conn:
+        discovered = conn.execute("SELECT DISTINCT domain FROM discovered_urls").fetchall()
+        skipped    = conn.execute("SELECT domain FROM skipped_sites").fetchall()
+        pending    = conn.execute("SELECT domain FROM pending_auth_sites").fetchall()
+    return {row["domain"] for row in (*discovered, *skipped, *pending)}
+
+
+def batch_insert_discovered_urls(entries: list[dict], run_id: int) -> None:
+    """
+    Batch-inserts newly discovered URL records at end of discovery stage.
+    entries: list of {domain, url, url_type}
+    """
+    if not entries:
+        return
+    rows = [(e["domain"], e["url"], e["url_type"], run_id) for e in entries]
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT INTO discovered_urls (domain, url, url_type, run_id) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+    logger.debug("Batch-inserted %d discovered URLs for run %d", len(rows), run_id)
+
+
+def update_discovered_url_status(domain: str, status: str) -> None:
+    """Updates scrape outcome for a domain within the current run."""
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE discovered_urls SET status=?
+               WHERE domain=? AND id=(
+                   SELECT id FROM discovered_urls WHERE domain=?
+                   ORDER BY discovered_at DESC LIMIT 1
+               )""",
+            (status, domain, domain),
+        )
+
+
+def get_pending_discovered_urls(run_id: int) -> list:
+    """Returns URLs from the current run that haven't been scraped yet — for resume."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM discovered_urls WHERE run_id=? AND status='pending'",
+            (run_id,),
+        ).fetchall()
+
+
+def count_discovered_urls_by_run(run_id: int) -> dict:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) as n FROM discovered_urls WHERE run_id=? GROUP BY status",
+            (run_id,),
+        ).fetchall()
+    return {row["status"]: row["n"] for row in rows}
+
+
+# ── Pending Auth Sites ─────────────────────────────────────────────────────────
+
+def add_pending_auth_site(domain: str, site_url: str, site_name: str) -> None:
+    """Queues a domain for re-auth prompt on next run after a timeout skip."""
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                """INSERT INTO pending_auth_sites (domain, site_url, site_name)
+                   VALUES (?, ?, ?)""",
+                (domain, site_url, site_name),
+            )
+        except sqlite3.IntegrityError:
+            # Already queued — increment attempt counter
+            conn.execute(
+                """UPDATE pending_auth_sites
+                   SET attempts = attempts + 1, skipped_at = datetime('now')
+                   WHERE domain = ?""",
+                (domain,),
+            )
+
+
+def get_pending_auth_sites() -> list:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM pending_auth_sites ORDER BY attempts DESC, skipped_at ASC"
+        ).fetchall()
+
+
+def remove_pending_auth_site(domain: str) -> None:
+    """Called when the user successfully logs in or permanently declines."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pending_auth_sites WHERE domain=?", (domain,))
