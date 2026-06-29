@@ -368,40 +368,15 @@ def cmd_dashboard() -> None:
 
 async def cmd_setup_sender() -> None:
     """
-    One-time interactive Outlook Web login.
-    Opens a real browser window — log in normally (handles MFA, 2FA, etc.).
-    Session saved to browser_profiles/outlook_sender/state.json.
-    All future dispatch runs restore this session silently; no password needed.
-    Re-run this command if dispatch reports the session has expired.
+    Explicit Outlook Web login — useful for refreshing an expired session.
+    On first --run or --send this is triggered automatically; no need to call it manually.
     """
-    from playwright.async_api import async_playwright
-    from pathlib import Path
-
-    session_dir  = Path(settings.BROWSER_PROFILES_DIR) / "outlook_sender"
-    session_file = session_dir / "state.json"
-    session_dir.mkdir(parents=True, exist_ok=True)
-
     console.rule("[cyan]Outlook Sender Setup[/cyan]")
-    console.print(
-        "\n  A browser window will open at Outlook Web.\n"
-        "  Log in as [bold]" + settings.SMTP_ADDRESS + "[/bold] (handle any MFA prompts normally).\n"
-        "  Once you can see your inbox, come back here and press Enter.\n"
-    )
-
-    async with async_playwright() as pw:
-        browser_type = getattr(pw, settings.BROWSER_ENGINE, pw.firefox)
-        browser = await browser_type.launch(headless=False)
-        context = await browser.new_context()
-        page    = await context.new_page()
-        await page.goto("https://outlook.live.com/mail/0/")
-
-        await asyncio.to_thread(input, "  Press Enter once you see your Outlook inbox... ")
-
-        await context.storage_state(path=str(session_file))
-        await browser.close()
-
-    console.print(f"\n  [bold green]Session saved.[/bold green]")
-    console.print("  Run [bold]python main.py --send[/bold] or [bold]--run[/bold] to dispatch emails.\n")
+    try:
+        await dispatcher.ensure_session()
+        console.print("  Run [bold]python main.py --run[/bold] to start the pipeline.\n")
+    except Exception as exc:
+        console.print(f"  [red]Setup failed:[/red] {exc}\n")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

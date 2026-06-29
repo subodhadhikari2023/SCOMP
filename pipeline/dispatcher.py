@@ -26,13 +26,48 @@ _SESSION_FILE = _SESSION_DIR / "state.json"
 _INBOX_URL    = "https://outlook.live.com/mail/0/"
 
 
-async def _is_logged_in(page: Page) -> bool:
-    await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
+async def _wait_for_inbox(page: Page, timeout_ms: int = 8000) -> bool:
     try:
-        await page.wait_for_selector('[aria-label="New mail"]', timeout=8000)
+        await page.wait_for_selector('[aria-label="New mail"]', timeout=timeout_ms)
         return True
     except Exception:
         return False
+
+
+async def ensure_session() -> None:
+    """
+    Opens a headed browser and waits for the user to log into Outlook.
+    Session is saved automatically once the inbox loads — no button press needed.
+    Called automatically by run_dispatch when no session file exists.
+    Also callable explicitly via: python main.py --setup-sender
+    """
+    from rich.console import Console
+    console = Console()
+
+    _SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+    async with async_playwright() as pw:
+        browser_type = getattr(pw, settings.BROWSER_ENGINE, pw.firefox)
+        browser = await browser_type.launch(headless=False)
+        context = await browser.new_context()
+        page    = await context.new_page()
+
+        await page.goto(_INBOX_URL)
+
+        console.print(
+            f"\n  [cyan]Log into Outlook as[/cyan] [bold]{settings.SMTP_ADDRESS}[/bold]\n"
+            "  [dim]Session saves automatically once your inbox finishes loading.[/dim]\n"
+        )
+
+        # Wait up to 3 minutes — covers slow connections + MFA
+        if not await _wait_for_inbox(page, timeout_ms=180_000):
+            await browser.close()
+            raise RuntimeError("Timed out waiting for Outlook inbox. Run --setup-sender to retry.")
+
+        await context.storage_state(path=str(_SESSION_FILE))
+        await browser.close()
+
+    console.print("  [green]Session saved — continuing...[/green]\n")
 
 
 async def _compose_and_send(page: Page, to: str, subject: str, body: str) -> bool:
@@ -84,11 +119,13 @@ async def run_dispatch(progress_callback=None) -> dict:
         return stats
 
     if not _SESSION_FILE.exists():
-        logger.error(
-            "No Outlook session found. Run: python main.py --setup-sender"
-        )
-        stats["halted"] = True
-        return stats
+        logger.info("No Outlook session — triggering first-time login...")
+        try:
+            await ensure_session()
+        except Exception as exc:
+            logger.error("Session setup failed: %s", exc)
+            stats["halted"] = True
+            return stats
 
     already_sent_today = database.count_sent_today()
     remaining_cap = settings.DAILY_EMAIL_CAP - already_sent_today
@@ -109,10 +146,9 @@ async def run_dispatch(progress_callback=None) -> dict:
         )
         page: Page = await context.new_page()
 
-        if not await _is_logged_in(page):
-            logger.error(
-                "Outlook session has expired. Run: python main.py --setup-sender"
-            )
+        await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
+        if not await _wait_for_inbox(page):
+            logger.error("Outlook session expired — run: python main.py --setup-sender")
             stats["halted"] = True
             await browser.close()
             return stats
