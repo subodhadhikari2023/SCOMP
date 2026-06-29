@@ -1,0 +1,31 @@
+# Secrets
+.env
+
+# Database
+db/*.sqlite
+
+# Logs
+logs/
+
+# Browser sessions
+browser_profiles/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Playwright
+.playwright/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime state
+.autostart_asked
