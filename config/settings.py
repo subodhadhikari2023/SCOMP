@@ -9,7 +9,6 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 # ── SMTP ──────────────────────────────────────────────────────────────────────
 SMTP_ADDRESS: str  = os.getenv("SMTP_ADDRESS", "")
-SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
 SMTP_HOST: str     = "smtp-mail.outlook.com"
 SMTP_PORT: int     = 587
 DAILY_EMAIL_CAP: int = int(os.getenv("DAILY_EMAIL_CAP", "80"))

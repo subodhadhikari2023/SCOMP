@@ -18,7 +18,7 @@ from db import database
 logger = logging.getLogger(__name__)
 
 _client: genai.Client | None = None
-_MODEL  = "gemini-2.0-flash"
+_MODEL  = "gemini-2.5-flash"
 
 
 def _get_client() -> genai.Client:

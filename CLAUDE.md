@@ -8,7 +8,7 @@ This file is for future Claude Code sessions working on this project.
 
 S.C.O.M.P (Stealth Collection, Outreach & Messaging Pipeline) is a single-operator,
 zero-budget Python CLI that automates cold email outreach for freelance/job opportunities.
-It uses only free-tier services (Bing search, Gemini free tier, Outlook SMTP).
+It uses only free-tier services (Bing search, Gemini free tier, Outlook SMTP via OAuth2).
 
 ---
 
@@ -52,6 +52,28 @@ Files are built in dependency order: db → config → scraper → pipeline → 
 - Any non-public data sources
 
 ---
+
+## Email dispatch — Outlook Web via Playwright
+
+Microsoft permanently disabled basic SMTP auth for personal Outlook.com accounts (error 5.7.139),
+and OAuth2 app registration is not accessible to personal accounts without an Azure subscription.
+
+The dispatcher uses Playwright to automate Outlook Web (outlook.live.com) instead of SMTP:
+- Sends from the real subodhadhikari2023@outlook.com address
+- No SMTP, no OAuth2, no Azure app required
+- Session saved to browser_profiles/outlook_sender/state.json (gitignored)
+
+First-time setup:
+  `python main.py --setup-sender`
+  Opens a headed browser — user logs in once, handles any MFA.
+  Session persists for weeks. Re-run when dispatcher reports session expired.
+
+Key selectors (stable in Outlook Web as of 2026):
+  New mail:  [aria-label="New mail"]
+  To field:  input[aria-label="To"]
+  Subject:   [aria-label="Add a subject"]
+  Body:      div[aria-label="Message body, press Alt+F10 to exit"]
+  Send:      Ctrl+Return keyboard shortcut
 
 ## Known rough edges to address in v2
 

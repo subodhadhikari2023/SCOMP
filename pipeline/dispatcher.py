@@ -1,67 +1,99 @@
 """
-Dispatcher: drip-sends drafted emails via Outlook SMTP.
-Random 4–12 minute gap between sends. Hard daily cap enforced.
-Atomic DB update per send. Halts on SMTP auth failure.
+Dispatcher: drip-sends drafted emails via Outlook Web (Playwright).
+
+Auth model:
+  Run `python main.py --setup-sender` once to log into Outlook in a headed browser.
+  Session state is saved to browser_profiles/outlook_sender/state.json.
+  All subsequent dispatch runs restore that session silently (no password needed).
+  If the session expires (weeks later), re-run --setup-sender.
 """
 
 import asyncio
+import json
 import logging
 import random
-import smtplib
-import time
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from typing import Optional
+from pathlib import Path
+
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from config import settings
 from db import database
 
 logger = logging.getLogger(__name__)
 
-
-def _build_message(from_addr: str, to_addr: str, subject: str, body: str) -> MIMEMultipart:
-    msg = MIMEMultipart("alternative")
-    msg["From"]    = from_addr
-    msg["To"]      = to_addr
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-    return msg
+_SESSION_DIR  = Path(settings.BROWSER_PROFILES_DIR) / "outlook_sender"
+_SESSION_FILE = _SESSION_DIR / "state.json"
+_INBOX_URL    = "https://outlook.live.com/mail/0/"
 
 
-def _send_one(smtp: smtplib.SMTP, from_addr: str, email_row: dict) -> bool:
-    to_addr = email_row["recipient_email"]
-    subject = email_row["subject"]
-    body    = email_row["body"]
+async def _is_logged_in(page: Page) -> bool:
+    await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
     try:
-        msg = _build_message(from_addr, to_addr, subject, body)
-        smtp.sendmail(from_addr, to_addr, msg.as_string())
-        logger.info("Sent → %s (%s)", to_addr, email_row.get("company", ""))
+        await page.wait_for_selector('[aria-label="New mail"]', timeout=8000)
         return True
-    except smtplib.SMTPRecipientsRefused:
-        logger.warning("Recipient refused: %s", to_addr)
-        return False
-    except smtplib.SMTPException as exc:
-        logger.error("SMTP error sending to %s: %s", to_addr, exc)
+    except Exception:
         return False
 
 
-def run_dispatch(progress_callback=None) -> dict:
+async def _compose_and_send(page: Page, to: str, subject: str, body: str) -> bool:
+    try:
+        # Open compose window
+        await page.click('[aria-label="New mail"]', timeout=10000)
+
+        # To field — focus is here on compose open
+        to_input = page.locator('input[aria-label="To"]').first
+        await to_input.wait_for(state="visible", timeout=8000)
+        await to_input.fill(to)
+        await to_input.press("Tab")
+
+        # Subject
+        subj = page.locator('[aria-label="Add a subject"]').first
+        await subj.wait_for(state="visible", timeout=8000)
+        await subj.fill(subject)
+
+        # Body (contenteditable div)
+        body_el = page.locator('div[aria-label="Message body, press Alt+F10 to exit"]').first
+        await body_el.wait_for(state="visible", timeout=8000)
+        await body_el.click()
+        await body_el.fill(body)
+
+        # Send via keyboard shortcut — more reliable than clicking the button
+        await page.keyboard.press("Control+Return")
+        await page.wait_for_timeout(2000)
+        return True
+
+    except Exception as exc:
+        logger.error("Compose/send failed for %s: %s", to, exc)
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
+async def run_dispatch(progress_callback=None) -> dict:
     """
-    Connects to Outlook SMTP and drip-sends all drafted emails.
-    progress_callback(sent, cap) is called after each successful send.
+    Restores saved Outlook session and drip-sends all drafted emails.
     Returns stats: {sent, skipped, halted}
     """
     stats = {"sent": 0, "skipped": 0, "halted": False}
 
-    if not settings.SMTP_ADDRESS or not settings.SMTP_PASSWORD:
-        logger.error("SMTP credentials not configured — aborting dispatch.")
+    if not settings.SMTP_ADDRESS:
+        logger.error("SMTP_ADDRESS not set in .env — aborting dispatch.")
+        stats["halted"] = True
+        return stats
+
+    if not _SESSION_FILE.exists():
+        logger.error(
+            "No Outlook session found. Run: python main.py --setup-sender"
+        )
         stats["halted"] = True
         return stats
 
     already_sent_today = database.count_sent_today()
     remaining_cap = settings.DAILY_EMAIL_CAP - already_sent_today
     if remaining_cap <= 0:
-        logger.info("Daily email cap already reached (%d). Dispatch skipped.", settings.DAILY_EMAIL_CAP)
+        logger.info("Daily cap reached (%d). Dispatch skipped.", settings.DAILY_EMAIL_CAP)
         return stats
 
     drafted = database.get_drafted_emails()
@@ -69,57 +101,62 @@ def run_dispatch(progress_callback=None) -> dict:
         logger.info("No drafted emails to dispatch.")
         return stats
 
-    logger.info("Connecting to %s:%d ...", settings.SMTP_HOST, settings.SMTP_PORT)
-    try:
-        smtp = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.login(settings.SMTP_ADDRESS, settings.SMTP_PASSWORD)
-    except smtplib.SMTPAuthenticationError as exc:
-        logger.error("SMTP authentication failed: %s", exc)
-        stats["halted"] = True
-        return stats
-    except smtplib.SMTPException as exc:
-        logger.error("SMTP connection error: %s", exc)
-        stats["halted"] = True
-        return stats
+    async with async_playwright() as pw:
+        browser_type = getattr(pw, settings.BROWSER_ENGINE, pw.firefox)
+        browser: Browser = await browser_type.launch(headless=True)
+        context: BrowserContext = await browser.new_context(
+            storage_state=str(_SESSION_FILE)
+        )
+        page: Page = await context.new_page()
 
-    logger.info("Dispatch starting. Cap remaining today: %d", remaining_cap)
+        if not await _is_logged_in(page):
+            logger.error(
+                "Outlook session has expired. Run: python main.py --setup-sender"
+            )
+            stats["halted"] = True
+            await browser.close()
+            return stats
 
-    try:
-        for email_row in drafted:
+        logger.info("Outlook session valid. Dispatch starting — cap remaining: %d", remaining_cap)
+
+        for i, email_row in enumerate(drafted):
             if stats["sent"] >= remaining_cap:
-                logger.info("Daily cap reached. Halting dispatcher.")
+                logger.info("Daily cap reached mid-run. Stopping.")
                 break
 
             row = dict(email_row)
-            success = _send_one(smtp, settings.SMTP_ADDRESS, row)
+            success = await _compose_and_send(
+                page,
+                row["recipient_email"],
+                row["subject"],
+                row["body"],
+            )
 
             if success:
                 database.mark_email_sent(row["id"], row["lead_id"])
                 stats["sent"] += 1
                 if progress_callback:
                     progress_callback(already_sent_today + stats["sent"], settings.DAILY_EMAIL_CAP)
+                logger.info("Sent → %s (%s)", row["recipient_email"], row.get("company", ""))
 
-                # Random gap: 4–12 minutes
-                if stats["sent"] < remaining_cap and drafted.index(email_row) < len(drafted) - 1:
+                if stats["sent"] < remaining_cap and i < len(drafted) - 1:
                     gap = random.randint(
                         settings.DISPATCH_GAP_MIN * 60,
                         settings.DISPATCH_GAP_MAX * 60,
                     )
                     logger.debug("Waiting %ds before next send...", gap)
-                    time.sleep(gap)
+                    await asyncio.sleep(gap)
             else:
-                database.update_lead_status(
-                    row["lead_id"], "flagged", "send failed — recipient refused"
-                )
+                database.update_lead_status(row["lead_id"], "flagged", "web send failed")
                 stats["skipped"] += 1
 
-    finally:
+        # Persist refreshed session state
         try:
-            smtp.quit()
+            await context.storage_state(path=str(_SESSION_FILE))
         except Exception:
             pass
+
+        await browser.close()
 
     logger.info("Dispatch complete: %s", stats)
     return stats

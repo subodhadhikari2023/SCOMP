@@ -3,13 +3,14 @@ S.C.O.M.P  —  Stealth Collection, Outreach & Messaging Pipeline
 Entry point and pipeline orchestrator.
 
 Usage:
-  python main.py --run          Full pipeline end to end
-  python main.py --discover     Discovery + scraping only
-  python main.py --write        Copywriting only
-  python main.py --send         Dispatch only
-  python main.py --dashboard    Live terminal dashboard
-  python main.py --summary      Print today's run summary
-  python main.py --setup        First-time setup wizard
+  python main.py --run            Full pipeline end to end
+  python main.py --discover       Discovery + scraping only
+  python main.py --write          Copywriting only
+  python main.py --send           Dispatch only
+  python main.py --dashboard      Live terminal dashboard
+  python main.py --summary        Print today's run summary
+  python main.py --setup          First-time setup wizard
+  python main.py --setup-sender   One-time Outlook Web login (run before first --send)
 """
 
 import argparse
@@ -310,7 +311,7 @@ async def cmd_run() -> None:
     console.print(f"  Drafted: {copy['drafted']}  Flagged: {copy['flagged']}")
 
     console.rule("[cyan]Stage 7 — Dispatch[/cyan]")
-    dispatch = dispatcher.run_dispatch(
+    dispatch = await dispatcher.run_dispatch(
         progress_callback=lambda sent, cap: console.print(f"  Sent {sent}/{cap}", end="\r")
     )
     stats["emails_sent"]    = dispatch["sent"]
@@ -349,12 +350,12 @@ def cmd_write() -> None:
     console.print(f"  Drafted: {stats['drafted']}  Flagged: {stats['flagged']}")
 
 
-def cmd_send() -> None:
+async def cmd_send() -> None:
     console.rule("[cyan]Dispatch[/cyan]")
-    stats = dispatcher.run_dispatch()
+    stats = await dispatcher.run_dispatch()
     console.print(f"  Sent: {stats['sent']}  Skipped: {stats['skipped']}")
     if stats.get("halted"):
-        console.print("  [red]Dispatcher halted — check SMTP credentials.[/red]")
+        console.print("  [red]Dispatcher halted — run: python main.py --setup-sender[/red]")
 
 
 def cmd_summary() -> None:
@@ -363,6 +364,44 @@ def cmd_summary() -> None:
 
 def cmd_dashboard() -> None:
     dashboard.render_live()
+
+
+async def cmd_setup_sender() -> None:
+    """
+    One-time interactive Outlook Web login.
+    Opens a real browser window — log in normally (handles MFA, 2FA, etc.).
+    Session saved to browser_profiles/outlook_sender/state.json.
+    All future dispatch runs restore this session silently; no password needed.
+    Re-run this command if dispatch reports the session has expired.
+    """
+    from playwright.async_api import async_playwright
+    from pathlib import Path
+
+    session_dir  = Path(settings.BROWSER_PROFILES_DIR) / "outlook_sender"
+    session_file = session_dir / "state.json"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    console.rule("[cyan]Outlook Sender Setup[/cyan]")
+    console.print(
+        "\n  A browser window will open at Outlook Web.\n"
+        "  Log in as [bold]" + settings.SMTP_ADDRESS + "[/bold] (handle any MFA prompts normally).\n"
+        "  Once you can see your inbox, come back here and press Enter.\n"
+    )
+
+    async with async_playwright() as pw:
+        browser_type = getattr(pw, settings.BROWSER_ENGINE, pw.firefox)
+        browser = await browser_type.launch(headless=False)
+        context = await browser.new_context()
+        page    = await context.new_page()
+        await page.goto("https://outlook.live.com/mail/0/")
+
+        await asyncio.to_thread(input, "  Press Enter once you see your Outlook inbox... ")
+
+        await context.storage_state(path=str(session_file))
+        await browser.close()
+
+    console.print(f"\n  [bold green]Session saved.[/bold green]")
+    console.print("  Run [bold]python main.py --send[/bold] or [bold]--run[/bold] to dispatch emails.\n")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -383,7 +422,8 @@ def main() -> None:
     group.add_argument("--send",      action="store_true", help="Dispatch drafted emails")
     group.add_argument("--dashboard", action="store_true", help="Live terminal dashboard")
     group.add_argument("--summary",   action="store_true", help="Today's run snapshot")
-    group.add_argument("--setup",     action="store_true", help="Re-run first-boot setup wizard")
+    group.add_argument("--setup",         action="store_true", help="Re-run first-boot setup wizard")
+    group.add_argument("--setup-sender",  action="store_true", help="One-time Outlook Web login — saves session for silent dispatch")
     args = parser.parse_args()
 
     if args.run:
@@ -393,7 +433,7 @@ def main() -> None:
     elif args.write:
         cmd_write()
     elif args.send:
-        cmd_send()
+        asyncio.run(cmd_send())
     elif args.dashboard:
         cmd_dashboard()
     elif args.summary:
@@ -403,6 +443,8 @@ def main() -> None:
         if lock.exists():
             lock.unlink()
         _check_first_boot()
+    elif args.setup_sender:
+        asyncio.run(cmd_setup_sender())
 
 
 if __name__ == "__main__":
