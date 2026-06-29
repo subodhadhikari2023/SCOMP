@@ -38,7 +38,7 @@ SCOMP/
 ```bash
 cd SCOMP
 cp .env.example .env
-# Fill in GEMINI_API_KEY, SMTP_ADDRESS, SMTP_PASSWORD
+# Fill in GEMINI_API_KEY and SMTP_ADDRESS
 ```
 
 ### 2. Run with Docker (recommended)
@@ -73,6 +73,7 @@ python main.py --run
 | `python main.py --dashboard` | Live auto-refreshing terminal dashboard |
 | `python main.py --summary` | Print today's run snapshot |
 | `python main.py --setup` | Re-run first-boot setup wizard |
+| `python main.py --setup-sender` | Refresh Outlook Web session (if expired) |
 
 ---
 
@@ -113,10 +114,12 @@ Any stage → [retry | flagged | error | skipped | manual]
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | Yes | Google AI Studio free tier key |
-| `SMTP_ADDRESS` | Yes | Your Outlook address |
-| `SMTP_PASSWORD` | Yes | Outlook app password |
-| `DAILY_EMAIL_CAP` | No | Default: 80 |
-| `AUTH_PROMPT_TIMEOUT` | No | Seconds before skipping an auth site. Default: 120 |
+| `SMTP_ADDRESS` | Yes | Your Outlook address (emails sent from here via Outlook Web) |
+| `DAILY_EMAIL_CAP` | No | Max emails per day. Default: 80 |
+| `SEARCH_ENGINE` | No | `bing` or `duckduckgo`. Default: bing |
+| `BROWSER_ENGINE` | No | `firefox`, `chromium`, or `webkit`. Default: firefox |
+| `AUTH_PROMPT_TIMEOUT` | No | Seconds before skipping an auth-required site. Default: 60 |
+| `DISCOVERY_FLUSH_EVERY` | No | URLs buffered before DB flush. Default: 50 |
 
 ---
 
