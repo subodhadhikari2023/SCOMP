@@ -2,67 +2,88 @@
 Copywriter: calls Gemini API to generate personalised email body + subject line.
 Two separate calls per lead. Validates output. Retries once on failure.
 Flags lead after two consecutive failures.
+Uses the google-genai SDK (replaces deprecated google-generativeai).
 """
 
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from config import settings
 from db import database
 
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=settings.GEMINI_API_KEY)
-_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+_client: genai.Client | None = None
+_MODEL  = "gemini-2.0-flash"
 
-_SYSTEM_PROMPT = """You are a technical copywriter writing cold outreach emails for a software
-developer seeking freelance or job opportunities. Output rules:
-- Under 100 words strictly
-- First person, direct tone
-- Specific to the company's domain — no generic claims
-- Forbidden phrases: "I hope", "passionate", "excited to", "leverage",
-  "synergy", "innovative", "cutting-edge", "I wanted to reach out",
-  "touch base", "circle back"
-- End with one clear low-friction call to action
-- Return only the email body, nothing else"""
 
-_BODY_TEMPLATE = """Company: {company}
-Industry: {niche}
-What they do: {company_desc}
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        if not settings.GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not set. Add it to your .env file.")
+        _client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _client
 
-My stack: Java (Spring Boot), Python, Docker, GitHub Actions CI/CD
-My work: Internship Management Portal (Angular + Spring Boot + JWT + MySQL),
-CampusConnect (Railway deployment, Docker, 194 automated tests)
+_SYSTEM_PROMPT = (
+    "You are a technical copywriter writing cold outreach emails for a software "
+    "developer seeking freelance or job opportunities. Output rules:\n"
+    "- Under 100 words strictly\n"
+    "- First person, direct tone\n"
+    "- Specific to the company's domain — no generic claims\n"
+    "- Forbidden phrases: \"I hope\", \"passionate\", \"excited to\", \"leverage\", "
+    "\"synergy\", \"innovative\", \"cutting-edge\", \"I wanted to reach out\", "
+    "\"touch base\", \"circle back\"\n"
+    "- End with one clear low-friction call to action\n"
+    "- Return only the email body, nothing else"
+)
 
-Write a cold outreach email for a freelance backend/full-stack opportunity."""
+_BODY_TEMPLATE = (
+    "Company: {company}\n"
+    "Industry: {niche}\n"
+    "What they do: {company_desc}\n\n"
+    "My stack: Java (Spring Boot), Python, Docker, GitHub Actions CI/CD\n"
+    "My work: Internship Management Portal (Angular + Spring Boot + JWT + MySQL),\n"
+    "CampusConnect (Railway deployment, Docker, 194 automated tests)\n\n"
+    "Write a cold outreach email for a freelance backend/full-stack opportunity."
+)
 
-_SUBJECT_TEMPLATE = """Write a subject line for this cold email:
-- Under 8 words
-- No punctuation at end
-- Not a question
-- Reference something specific about their company or industry
-- Forbidden: "Quick question", "Following up", "Opportunity", "Hi"
+_SUBJECT_TEMPLATE = (
+    "Write a subject line for this cold email:\n"
+    "- Under 8 words\n"
+    "- No punctuation at end\n"
+    "- Not a question\n"
+    "- Reference something specific about their company or industry\n"
+    "- Forbidden: \"Quick question\", \"Following up\", \"Opportunity\", \"Hi\"\n\n"
+    "Email body: {email_body}\n"
+    "Company: {company_name}"
+)
 
-Email body: {email_body}
-Company: {company_name}"""
+_GEN_CONFIG = types.GenerateContentConfig(
+    temperature=0.7,
+    max_output_tokens=300,
+    system_instruction=_SYSTEM_PROMPT,
+)
 
 
 def _validate(text: str) -> bool:
-    word_count = len(text.split())
-    has_forbidden = any(f in text.lower() for f in settings.FORBIDDEN_PHRASES)
+    word_count     = len(text.split())
+    has_forbidden  = any(f in text.lower() for f in settings.FORBIDDEN_PHRASES)
     return word_count <= settings.EMAIL_BODY_MAX_WORDS and not has_forbidden
 
 
 def _call_gemini(prompt: str) -> Optional[str]:
     try:
-        response = _MODEL.generate_content(
-            f"{_SYSTEM_PROMPT}\n\n{prompt}",
-            generation_config={"temperature": 0.7, "max_output_tokens": 300},
+        response = _get_client().models.generate_content(
+            model=_MODEL,
+            contents=prompt,
+            config=_GEN_CONFIG,
         )
-        return response.text.strip()
+        return response.text.strip() if response.text else None
     except Exception as exc:
         logger.warning("Gemini API error: %s", exc)
         return None
@@ -79,7 +100,7 @@ def _generate_body(lead: dict) -> Optional[str]:
         if text and _validate(text):
             return text
         if attempt == 0:
-            logger.debug("Body validation failed, retrying for lead_id=%s", lead.get("id"))
+            logger.debug("Body validation failed — retrying lead_id=%s", lead.get("id"))
             time.sleep(2)
     return None
 
@@ -111,7 +132,7 @@ def run_copywriting() -> dict:
 
     for lead in leads:
         lead_dict = dict(lead)
-        lead_id = lead_dict["id"]
+        lead_id   = lead_dict["id"]
 
         body = _generate_body(lead_dict)
         if not body:
@@ -123,14 +144,12 @@ def run_copywriting() -> dict:
         if not subject:
             subject = f"Backend developer available — {lead_dict.get('company', 'your team')}"
 
-        word_count = len(body.split())
-        database.insert_email(lead_id, subject, body, word_count)
+        database.insert_email(lead_id, subject, body, len(body.split()))
         database.update_lead_status(lead_id, "drafted")
         stats["drafted"] += 1
-        logger.debug("Drafted email for lead_id=%d (%s)", lead_id, lead_dict.get("company"))
+        logger.debug("Drafted for lead_id=%d (%s)", lead_id, lead_dict.get("company"))
 
-        # Respect Gemini free-tier rate limits
-        time.sleep(1.5)
+        time.sleep(1.5)  # free-tier rate limit
 
     logger.info("Copywriting done: %s", stats)
     return stats
