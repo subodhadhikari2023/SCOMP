@@ -27,7 +27,7 @@ TARGETS_YAML  = str(BASE_DIR / "config" / "targets.yaml")
 
 # ── Auth bootstrap timeout ────────────────────────────────────────────────────
 # Seconds to wait for user response before skipping an auth-required site
-AUTH_PROMPT_TIMEOUT: int = int(os.getenv("AUTH_PROMPT_TIMEOUT", "120"))
+AUTH_PROMPT_TIMEOUT: int = int(os.getenv("AUTH_PROMPT_TIMEOUT", "60"))
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 DISPATCH_GAP_MIN: int = 4   # minutes

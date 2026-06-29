@@ -19,15 +19,14 @@ import os
 import platform
 import subprocess
 import sys
-import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 from bs4 import BeautifulSoup
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 
-# ── Bootstrap path so sub-packages can find each other ───────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import settings
@@ -38,16 +37,16 @@ from ui import dashboard
 
 console = Console()
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 def _setup_logging() -> None:
     os.makedirs(settings.LOG_DIR, exist_ok=True)
-    log_file = os.path.join(settings.LOG_DIR, "scomp.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(os.path.join(settings.LOG_DIR, "scomp.log")),
             logging.StreamHandler(sys.stdout),
         ],
     )
@@ -58,28 +57,21 @@ logger = logging.getLogger("scomp.main")
 # ── First-boot autostart ───────────────────────────────────────────────────────
 
 def _check_first_boot() -> None:
-    """
-    On first run after machine reboot (detected via absence of a lock file),
-    ask the user whether to register SCOMP as a startup service.
-    """
     lock = Path(settings.BASE_DIR) / ".autostart_asked"
     if lock.exists():
         return
-
     lock.touch()
     console.print()
-    console.rule("[bold cyan]S.C.O.M.P First-Boot Setup[/bold cyan]")
-    console.print()
+    console.rule("[bold cyan]S.C.O.M.P  —  First-Boot Setup[/bold cyan]")
     console.print(
-        "  SCOMP detected this is the first run after initial setup.\n"
-        "  It can be registered to start automatically when your machine boots."
+        "\n  SCOMP can register itself to start automatically when your machine boots.\n"
     )
-    console.print()
-
-    if Confirm.ask("  Register SCOMP to auto-start on system boot?", default=False):
+    if Confirm.ask("  Enable auto-start on boot?", default=False):
         _register_autostart()
     else:
-        console.print("  [dim]Skipped. Run [bold]python main.py --setup[/bold] anytime to configure this.[/dim]")
+        console.print(
+            "  [dim]Skipped. Run [bold]python main.py --setup[/bold] anytime to change this.[/dim]"
+        )
     console.print()
 
 
@@ -89,168 +81,90 @@ def _register_autostart() -> None:
     python = sys.executable
 
     if system == "Linux":
-        service = f"""[Unit]
-Description=S.C.O.M.P Outreach Pipeline
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory={base}
-ExecStart={python} {base}/main.py --run
-Restart=no
-StandardOutput=append:{settings.LOG_DIR}/scomp.log
-StandardError=append:{settings.LOG_DIR}/scomp.log
-
-[Install]
-WantedBy=default.target
-"""
-        service_path = Path.home() / ".config/systemd/user/scomp.service"
-        service_path.parent.mkdir(parents=True, exist_ok=True)
-        service_path.write_text(service)
+        service = (
+            f"[Unit]\nDescription=S.C.O.M.P Outreach Pipeline\nAfter=network.target\n\n"
+            f"[Service]\nType=simple\nWorkingDirectory={base}\n"
+            f"ExecStart={python} {base}/main.py --run\nRestart=no\n"
+            f"StandardOutput=append:{settings.LOG_DIR}/scomp.log\n"
+            f"StandardError=append:{settings.LOG_DIR}/scomp.log\n\n"
+            f"[Install]\nWantedBy=default.target\n"
+        )
+        svc = Path.home() / ".config/systemd/user/scomp.service"
+        svc.parent.mkdir(parents=True, exist_ok=True)
+        svc.write_text(service)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
         subprocess.run(["systemctl", "--user", "enable", "scomp.service"], check=False)
-        console.print("  [green]Systemd user service installed.[/green]")
-        console.print(f"  [dim]File: {service_path}[/dim]")
+        console.print(f"  [green]Systemd user service installed:[/green] {svc}")
 
     elif system == "Darwin":
-        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>          <string>com.scomp.pipeline</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{python}</string>
-    <string>{base}/main.py</string>
-    <string>--run</string>
-  </array>
-  <key>WorkingDirectory</key> <string>{base}</string>
-  <key>RunAtLoad</key>        <true/>
-  <key>StandardOutPath</key>  <string>{settings.LOG_DIR}/scomp.log</string>
-  <key>StandardErrorPath</key><string>{settings.LOG_DIR}/scomp.log</string>
-</dict>
-</plist>"""
+        plist = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n'
+            '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            f'  <key>Label</key><string>com.scomp.pipeline</string>\n'
+            f'  <key>ProgramArguments</key><array>'
+            f'<string>{python}</string><string>{base}/main.py</string>'
+            f'<string>--run</string></array>\n'
+            f'  <key>WorkingDirectory</key><string>{base}</string>\n'
+            f'  <key>RunAtLoad</key><true/>\n'
+            f'  <key>StandardOutPath</key><string>{settings.LOG_DIR}/scomp.log</string>\n'
+            f'  <key>StandardErrorPath</key><string>{settings.LOG_DIR}/scomp.log</string>\n'
+            '</dict></plist>\n'
+        )
         plist_path = Path.home() / "Library/LaunchAgents/com.scomp.pipeline.plist"
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(plist)
         subprocess.run(["launchctl", "load", str(plist_path)], check=False)
-        console.print("  [green]LaunchAgent plist installed.[/green]")
+        console.print(f"  [green]LaunchAgent installed:[/green] {plist_path}")
 
     elif system == "Windows":
-        task_cmd = (
+        cmd = (
             f'schtasks /create /tn "SCOMP" /tr "{python} {base}\\main.py --run" '
             f'/sc ONLOGON /rl HIGHEST /f'
         )
-        subprocess.run(task_cmd, shell=True, check=False)
+        subprocess.run(cmd, shell=True, check=False)
         console.print("  [green]Windows Task Scheduler entry created.[/green]")
 
     else:
-        console.print("  [yellow]Unsupported OS — add SCOMP to your startup manually.[/yellow]")
+        console.print("  [yellow]Unsupported OS — add SCOMP to startup manually.[/yellow]")
 
 
-# ── Pipeline stages ────────────────────────────────────────────────────────────
+# ── HTML helpers ──────────────────────────────────────────────────────────────
 
-async def _run_discovery_and_scraping() -> list[dict]:
-    """Stage 1–4: discover URLs, scrape, extract emails. Returns raw lead dicts."""
-    console.rule("[cyan]Stage 1 — Discovery[/cyan]")
-    urls = await discovery.discover_urls()
-    console.print(f"  [green]{len(urls)} URLs discovered.[/green]")
-
-    raw_leads: list[dict] = []
-    cfg = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
-    known = cfg.get("known_sites", {})
-
-    console.rule("[cyan]Stage 2–4 — Scraping + Email Extraction[/cyan]")
-    total = len(urls)
-
-    for i, entry in enumerate(urls, 1):
-        url       = entry["url"]
-        domain    = entry["domain"]
-        url_type  = entry["url_type"]
-
-        console.print(f"  [{i}/{total}] {domain}", end="\r")
-
-        # Check if this is a known site that requires auth
-        site_config = _match_known_site(domain, known)
-        profile_dir: str | None = None
-        if site_config and site_config.get("requires_auth"):
-            site_name  = _find_site_name(domain, known)
-            profile_dir = os.path.join(settings.BROWSER_PROFILES_DIR, site_name)
-            resolved = await auth_bootstrap.handle_auth_site(site_name, url, profile_dir)
-            if not resolved:
-                continue
-
-        html, track = await router.route(url, profile_dir)
-
-        if track == "auth_required":
-            # Discover which site name this belongs to
-            site_name  = _find_site_name(domain, known) or domain.split(".")[0]
-            profile_dir = os.path.join(settings.BROWSER_PROFILES_DIR, site_name)
-            resolved = await auth_bootstrap.handle_auth_site(site_name, url, profile_dir)
-            if resolved:
-                html, track = await router.route(url, profile_dir)
-
-        if not html:
-            continue
-
-        emails = await email_extractor.extract_emails(url, html)
-        if not emails:
-            continue
-
-        # Extract company name from HTML
-        company_name = _extract_company_name(html, url, site_config)
-        company_desc = _extract_company_desc(html, site_config)
-        niche        = _infer_niche(html)
-
-        for email in emails:
-            raw_leads.append({
-                "company":      company_name,
-                "email":        email,
-                "source_url":   url,
-                "company_desc": company_desc,
-                "niche":        niche,
-            })
-
-    console.print()
-    console.print(f"  [green]{len(raw_leads)} raw lead records extracted.[/green]")
-    return raw_leads
-
-
-def _match_known_site(domain: str, known: dict) -> dict | None:
-    for site_cfg in known.values():
-        from urllib.parse import urlparse
-        site_domain = urlparse(site_cfg.get("base_url", "")).netloc.lstrip("www.")
+def _get_known_site_config(domain: str, known: dict) -> dict | None:
+    """Returns the YAML config block for a domain if it is a known site."""
+    for cfg in known.values():
+        site_domain = urlparse(cfg.get("base_url", "")).netloc.lstrip("www.")
         if site_domain and site_domain in domain:
-            return site_cfg
+            return cfg
     return None
 
 
-def _find_site_name(domain: str, known: dict) -> str:
-    from urllib.parse import urlparse
-    for name, site_cfg in known.items():
-        site_domain = urlparse(site_cfg.get("base_url", "")).netloc.lstrip("www.")
+def _get_site_name(domain: str, known: dict) -> str:
+    """Returns the known site name or derives it from the domain."""
+    for name, cfg in known.items():
+        site_domain = urlparse(cfg.get("base_url", "")).netloc.lstrip("www.")
         if site_domain and site_domain in domain:
             return name
-    return domain.split(".")[0]
+    # Auto-derive: wellfound.com → wellfound, jobs.lever.co → lever
+    parts = domain.split(".")
+    return parts[-2] if len(parts) >= 2 else parts[0]
 
 
 def _extract_company_name(html: str, url: str, site_cfg: dict | None) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    # Try site-specific selector first
     if site_cfg:
         sel = (site_cfg.get("selectors") or {}).get("company_name")
         if sel:
             el = soup.select_one(sel)
             if el:
                 return el.get_text(strip=True)
-    # Fallback: <title> tag
     title = soup.find("title")
     if title:
         name = title.get_text(strip=True).split("|")[0].split("–")[0].strip()
         if name:
             return name
-    from urllib.parse import urlparse
     return urlparse(url).netloc.lstrip("www.").split(".")[0].capitalize()
 
 
@@ -262,7 +176,6 @@ def _extract_company_desc(html: str, site_cfg: dict | None) -> str:
             el = soup.select_one(sel)
             if el:
                 return el.get_text(strip=True)[:300]
-    # Fallback: meta description
     meta = soup.find("meta", attrs={"name": "description"})
     if meta and meta.get("content"):
         return meta["content"][:300]
@@ -270,16 +183,15 @@ def _extract_company_desc(html: str, site_cfg: dict | None) -> str:
 
 
 def _infer_niche(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ").lower()
+    text = BeautifulSoup(html, "html.parser").get_text(" ").lower()
     niches = {
-        "fintech":   ["fintech", "payment", "banking", "financial"],
-        "healthtech":["health", "medical", "clinic", "hospital", "pharma"],
-        "edtech":    ["education", "learning", "school", "university", "edtech"],
-        "saas":      ["saas", "software as a service", "cloud platform"],
-        "ecommerce": ["ecommerce", "e-commerce", "shop", "marketplace", "retail"],
-        "logistics": ["logistics", "supply chain", "shipping", "delivery"],
-        "devtools":  ["developer tools", "devtools", "api", "sdk", "open source"],
+        "fintech":    ["fintech", "payment", "banking", "financial"],
+        "healthtech": ["health", "medical", "clinic", "hospital", "pharma"],
+        "edtech":     ["education", "learning", "school", "university", "edtech"],
+        "saas":       ["saas", "software as a service", "cloud platform"],
+        "ecommerce":  ["ecommerce", "e-commerce", "shop", "marketplace", "retail"],
+        "logistics":  ["logistics", "supply chain", "shipping", "delivery"],
+        "devtools":   ["developer tools", "devtools", "api", "sdk", "open source"],
     }
     for niche, signals in niches.items():
         if any(s in text for s in signals):
@@ -287,57 +199,141 @@ def _infer_niche(html: str) -> str:
     return "technology"
 
 
+# ── Pipeline stages ────────────────────────────────────────────────────────────
+
+async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
+    """
+    Stages 1–4: discovery → scraping → email extraction → raw lead list.
+
+    Auth flow (fully automatic):
+      - Router detects auth walls on any site, not just pre-configured ones.
+      - On first encounter: user is prompted (60s timeout).
+      - On timeout: queued in pending_auth_sites for next run.
+      - Session state saved to browser_profiles/{site_name}/state.json.
+    """
+    # Load all previously seen domains into memory — one DB read, no per-URL queries
+    seen_domains: set = database.load_seen_domains()
+
+    console.rule("[cyan]Stage 1 — Discovery[/cyan]")
+    urls = await discovery.discover_urls(run_id, seen_domains)
+    console.print(f"  [green]{len(urls)} new URLs queued for scraping.[/green]")
+
+    cfg   = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
+    known = cfg.get("known_sites", {})  # optional selector hints only
+
+    raw_leads: list[dict] = []
+    total = len(urls)
+
+    console.rule("[cyan]Stages 2–4 — Scraping + Email Extraction[/cyan]")
+
+    for i, entry in enumerate(urls, 1):
+        url      = entry["url"]
+        domain   = entry["domain"]
+        site_cfg = _get_known_site_config(domain, known)
+
+        console.print(f"  [{i}/{total}] {domain[:55]:<55}", end="\r")
+
+        # Attempt to scrape; router handles fast/api/heavy decision
+        html, track = await router.route(url)
+
+        if track == "auth_required":
+            # Auth wall hit — fully automatic handling regardless of known_sites
+            site_name   = _get_site_name(domain, known)
+            profile_dir = os.path.join(settings.BROWSER_PROFILES_DIR, site_name)
+            resolved    = await auth_bootstrap.handle_auth_site(site_name, url, profile_dir)
+            if resolved:
+                html, track = await router.route(url, profile_dir)
+            else:
+                database.update_discovered_url_status(domain, "skipped")
+                continue
+
+        if not html:
+            database.update_discovered_url_status(domain, "failed")
+            continue
+
+        emails = await email_extractor.extract_emails(url, html)
+        if not emails:
+            database.update_discovered_url_status(domain, "scraped")
+            continue
+
+        company_name = _extract_company_name(html, url, site_cfg)
+        company_desc = _extract_company_desc(html, site_cfg)
+        niche        = _infer_niche(html)
+
+        for email in emails:
+            raw_leads.append({
+                "company":      company_name,
+                "email":        email,
+                "source_url":   url,
+                "company_desc": company_desc,
+                "niche":        niche,
+            })
+
+        database.update_discovered_url_status(domain, "scraped")
+
+    console.print()
+    console.print(f"  [green]{len(raw_leads)} raw lead records extracted.[/green]")
+    return raw_leads
+
+
 # ── Run modes ──────────────────────────────────────────────────────────────────
 
 async def cmd_run() -> None:
+    # Re-prompt any sites that timed out in previous runs
+    await auth_bootstrap.handle_pending_auth_sites()
+
     run_id = database.start_run()
     stats  = {"leads_attempted": 0, "emails_sent": 0, "emails_skipped": 0, "emails_flagged": 0}
 
-    # Stage 1–4
-    raw_leads = await _run_discovery_and_scraping()
+    raw_leads = await _run_discovery_and_scraping(run_id)
     stats["leads_attempted"] = len(raw_leads)
 
-    # Stage 5 — Normalise
     console.rule("[cyan]Stage 5 — Normalisation[/cyan]")
-    norm_stats = normalizer.normalize_and_store(raw_leads)
-    console.print(f"  Stored: {norm_stats['stored']}  Duplicates: {norm_stats['skipped_duplicate']}  "
-                  f"Invalid: {norm_stats['skipped_invalid']}  Manual: {norm_stats['flagged_manual']}")
-
-    # Stage 6 — Copywriting
-    console.rule("[cyan]Stage 6 — Copywriting[/cyan]")
-    copy_stats = copywriter.run_copywriting()
-    stats["emails_flagged"] = copy_stats["flagged"]
-    console.print(f"  Drafted: {copy_stats['drafted']}  Flagged: {copy_stats['flagged']}")
-
-    # Stage 7 — Dispatch
-    console.rule("[cyan]Stage 7 — Dispatch[/cyan]")
-    dispatch_stats = dispatcher.run_dispatch(
-        progress_callback=lambda sent, cap: console.print(
-            f"  Sent {sent}/{cap}", end="\r"
-        )
+    norm = normalizer.normalize_and_store(raw_leads)
+    console.print(
+        f"  Stored: {norm['stored']}  "
+        f"Duplicates: {norm['skipped_duplicate']}  "
+        f"Invalid: {norm['skipped_invalid']}  "
+        f"Manual: {norm['flagged_manual']}"
     )
-    stats["emails_sent"]    = dispatch_stats["sent"]
-    stats["emails_skipped"] = dispatch_stats["skipped"]
+
+    console.rule("[cyan]Stage 6 — Copywriting[/cyan]")
+    copy = copywriter.run_copywriting()
+    stats["emails_flagged"] = copy["flagged"]
+    console.print(f"  Drafted: {copy['drafted']}  Flagged: {copy['flagged']}")
+
+    console.rule("[cyan]Stage 7 — Dispatch[/cyan]")
+    dispatch = dispatcher.run_dispatch(
+        progress_callback=lambda sent, cap: console.print(f"  Sent {sent}/{cap}", end="\r")
+    )
+    stats["emails_sent"]    = dispatch["sent"]
+    stats["emails_skipped"] = dispatch["skipped"]
     console.print()
 
     database.finish_run(run_id, **stats)
-
     console.rule("[bold green]Run Complete[/bold green]")
-    console.print(f"  Sent: {stats['emails_sent']}  Skipped: {stats['emails_skipped']}  "
-                  f"Flagged: {stats['emails_flagged']}")
+    console.print(
+        f"  Sent: {stats['emails_sent']}  "
+        f"Skipped: {stats['emails_skipped']}  "
+        f"Flagged: {stats['emails_flagged']}"
+    )
 
-    # If daily cap is reached, signal container exit
     if database.count_sent_today() >= settings.DAILY_EMAIL_CAP:
         console.print("\n  [bold yellow]Daily cap reached. Shutting down.[/bold yellow]")
         sys.exit(0)
 
 
 async def cmd_discover() -> None:
-    raw_leads = await _run_discovery_and_scraping()
+    await auth_bootstrap.handle_pending_auth_sites()
+    run_id    = database.start_run()
+    raw_leads = await _run_discovery_and_scraping(run_id)
     console.rule("[cyan]Stage 5 — Normalisation[/cyan]")
-    stats = normalizer.normalize_and_store(raw_leads)
-    console.print(f"  Stored: {stats['stored']}  Duplicates: {stats['skipped_duplicate']}  "
-                  f"Invalid: {stats['skipped_invalid']}")
+    norm = normalizer.normalize_and_store(raw_leads)
+    console.print(
+        f"  Stored: {norm['stored']}  "
+        f"Duplicates: {norm['skipped_duplicate']}  "
+        f"Invalid: {norm['skipped_invalid']}"
+    )
 
 
 def cmd_write() -> None:
@@ -375,12 +371,12 @@ def main() -> None:
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--run",       action="store_true", help="Full pipeline end to end")
-    group.add_argument("--discover",  action="store_true", help="Discovery + scraping only")
-    group.add_argument("--write",     action="store_true", help="Copywriting only")
-    group.add_argument("--send",      action="store_true", help="Dispatch only")
+    group.add_argument("--discover",  action="store_true", help="Discovery + scraping + normalisation")
+    group.add_argument("--write",     action="store_true", help="Copywriting for ready leads")
+    group.add_argument("--send",      action="store_true", help="Dispatch drafted emails")
     group.add_argument("--dashboard", action="store_true", help="Live terminal dashboard")
-    group.add_argument("--summary",   action="store_true", help="Print today's run summary")
-    group.add_argument("--setup",     action="store_true", help="Run first-time setup wizard")
+    group.add_argument("--summary",   action="store_true", help="Today's run snapshot")
+    group.add_argument("--setup",     action="store_true", help="Re-run first-boot setup wizard")
     args = parser.parse_args()
 
     if args.run:
@@ -396,7 +392,6 @@ def main() -> None:
     elif args.summary:
         cmd_summary()
     elif args.setup:
-        # Reset the autostart lock to re-run the wizard
         lock = Path(settings.BASE_DIR) / ".autostart_asked"
         if lock.exists():
             lock.unlink()
