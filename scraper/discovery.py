@@ -148,7 +148,13 @@ async def _fetch_page(client: httpx.AsyncClient, engine_name: str, query: str, p
     return await _fetch_bing_page(client, engine, query, page)
 
 
-async def discover_urls(run_id: int, seen_domains: set) -> list:
+async def discover_urls(
+    run_id: int,
+    seen_domains: set,
+    on_query_start=None,
+    on_page_done=None,
+    on_query_done=None,
+) -> list:
     """
     Queries the configured search engine and returns new URLs to process.
 
@@ -184,8 +190,11 @@ async def discover_urls(run_id: int, seen_domains: set) -> list:
     flush_buffer:  list[dict] = []   # pending DB write — cleared after each flush
 
     async with httpx.AsyncClient() as client:
-        for query in queries:
+        for qi, query in enumerate(queries):
             logger.info("Querying [%s]: %r", engine_name, query)
+            if on_query_start:
+                on_query_start(query, qi, len(queries))
+
             for page in range(max_pages):
                 if len(all_entries) >= max_total:
                     break
@@ -218,12 +227,17 @@ async def discover_urls(run_id: int, seen_domains: set) -> list:
                             len(all_entries), len(seen_domains),
                         )
 
+                if on_page_done:
+                    on_page_done(query, page, max_pages, len(all_entries))
+
                 await asyncio.sleep(random.uniform(1.5, 3.0))
+
+            if on_query_done:
+                on_query_done(query, len(all_entries))
 
             if len(all_entries) >= max_total:
                 break
 
-            # Longer pause between queries to avoid DDG rate-limiting
             await asyncio.sleep(random.uniform(3.0, 6.0))
 
     # Final flush — clears any remainder that didn't hit the threshold

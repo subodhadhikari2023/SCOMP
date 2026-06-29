@@ -26,7 +26,10 @@ from urllib.parse import urlparse
 import yaml
 from bs4 import BeautifulSoup
 from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
 from rich.prompt import Confirm
+from rich.table import Table
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -43,14 +46,16 @@ console = Console()
 
 def _setup_logging() -> None:
     os.makedirs(settings.LOG_DIR, exist_ok=True)
+    # All detail goes to the log file; terminal output is handled by Rich UI only
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         handlers=[
             logging.FileHandler(os.path.join(settings.LOG_DIR, "scomp.log")),
-            logging.StreamHandler(sys.stdout),
         ],
     )
+    for lib in ("httpx", "httpcore", "playwright", "google_genai", "asyncio"):
+        logging.getLogger(lib).setLevel(logging.WARNING)
 
 logger = logging.getLogger("scomp.main")
 
@@ -209,43 +214,121 @@ def _infer_niche(html: str) -> str:
 
 # ── Pipeline stages ────────────────────────────────────────────────────────────
 
+def _discovery_panel(
+    completed: list,
+    current_query: str,
+    current_page: int,
+    total_pages: int,
+    total_queries: int,
+    total_urls: int,
+    engine: str,
+) -> Panel:
+    """Builds the live Stage 1 panel renderable."""
+    rows = Table.grid(padding=(0, 1))
+    rows.add_column(width=2)
+    rows.add_column(min_width=56, max_width=56)
+    rows.add_column(width=12, justify="right")
+
+    for q, count in completed[-12:]:
+        label = (q[:54] + "..") if len(q) > 56 else q
+        rows.add_row(
+            "[green]✓[/green]",
+            f"[dim]{label}[/dim]",
+            f"[green]{count}[/green] [dim]urls[/dim]",
+        )
+
+    if current_query:
+        label = (current_query[:54] + "..") if len(current_query) > 56 else current_query
+        filled = current_page
+        empty  = total_pages - current_page
+        bar    = f"[cyan]{'█' * filled}[/cyan][dim]{'░' * empty}[/dim]"
+        rows.add_row("[yellow]▶[/yellow]", f"[white]{label}[/white]", bar)
+
+    return Panel(
+        rows,
+        title="[bold white]  Stage 1  ·  Discovery  [/bold white]",
+        subtitle=(
+            f"[dim]engine[/dim] [bold cyan]{engine.upper()}[/bold cyan]"
+            f"[dim]  ·  {len(completed)}/{total_queries} queries  ·  [/dim]"
+            f"[bold green]{total_urls}[/bold green][dim] urls found[/dim]"
+        ),
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+
 async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
-    """
-    Stages 1–4: discovery → scraping → email extraction → raw lead list.
-
-    Auth flow (fully automatic):
-      - Router detects auth walls on any site, not just pre-configured ones.
-      - On first encounter: user is prompted (60s timeout).
-      - On timeout: queued in pending_auth_sites for next run.
-      - Session state saved to browser_profiles/{site_name}/state.json.
-    """
-    # Load all previously seen domains into memory — one DB read, no per-URL queries
     seen_domains: set = database.load_seen_domains()
+    cfg        = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
+    known      = cfg.get("known_sites", {})
+    disc_cfg   = cfg.get("discovery", {})
+    total_q    = len(disc_cfg.get("search_queries", []))
+    max_pages  = disc_cfg.get("max_pages_per_query", 5)
 
-    console.rule("[cyan]Stage 1 — Discovery[/cyan]")
-    urls = await discovery.discover_urls(run_id, seen_domains)
-    console.print(f"  [green]{len(urls)} new URLs queued for scraping.[/green]")
+    # ── Stage 1: Discovery ────────────────────────────────────────────────────
+    state = dict(completed=[], current="", page=0, prev_total=0, total=0)
 
-    cfg   = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
-    known = cfg.get("known_sites", {})  # optional selector hints only
+    def _panel():
+        return _discovery_panel(
+            state["completed"], state["current"], state["page"],
+            max_pages, total_q, state["total"], settings.SEARCH_ENGINE,
+        )
+
+    def on_query_start(query, idx, total):
+        state["current"]    = query
+        state["page"]       = 0
+        state["prev_total"] = state["total"]
+        live.update(_panel())
+
+    def on_page_done(query, page, total_pages, total_urls):
+        state["page"]  = page + 1
+        state["total"] = total_urls
+        live.update(_panel())
+
+    def on_query_done(query, total_urls):
+        state["completed"].append((query, total_urls - state["prev_total"]))
+        state["current"] = ""
+        state["total"]   = total_urls
+        live.update(_panel())
+
+    console.print()
+    with Live(_panel(), console=console, refresh_per_second=8) as live:
+        urls = await discovery.discover_urls(
+            run_id, seen_domains,
+            on_query_start=on_query_start,
+            on_page_done=on_page_done,
+            on_query_done=on_query_done,
+        )
+        state["current"] = ""
+        live.update(_panel())
+    console.print()
+
+    if not urls:
+        console.print("  [yellow]No new URLs discovered.[/yellow]\n")
+        return []
+
+    # ── Stages 2–4: Scraping + Email Extraction ───────────────────────────────
+    console.print(Panel(
+        f"  [dim]Processing[/dim] [bold white]{len(urls)}[/bold white] [dim]URLs[/dim]  ",
+        title="[bold white]  Stages 2–4  ·  Scraping  ·  Extraction  [/bold white]",
+        border_style="cyan",
+        padding=(0, 2),
+    ))
+    console.print()
 
     raw_leads: list[dict] = []
-    total = len(urls)
-
-    console.rule("[cyan]Stages 2–4 — Scraping + Email Extraction[/cyan]")
+    dom_w = 44
 
     for i, entry in enumerate(urls, 1):
         url      = entry["url"]
         domain   = entry["domain"]
         site_cfg = _get_known_site_config(domain, known)
+        prefix   = f"  [dim]{i:>3}/{len(urls)}[/dim]  [white]{domain[:dom_w]:<{dom_w}}[/white]"
 
-        console.print(f"  [{i}/{total}] {domain[:55]:<55}", end="\r")
-
-        # Attempt to scrape; router handles fast/api/heavy decision
         html, track = await router.route(url)
 
         if track == "auth_required":
-            # Auth wall hit — fully automatic handling regardless of known_sites
+            console.print(f"{prefix}  [yellow]⚠  auth required[/yellow]")
             site_name   = _get_site_name(domain, known)
             profile_dir = os.path.join(settings.BROWSER_PROFILES_DIR, site_name)
             resolved    = await auth_bootstrap.handle_auth_site(site_name, url, profile_dir)
@@ -256,17 +339,25 @@ async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
                 continue
 
         if not html:
+            console.print(f"{prefix}  [dim]✗  no content[/dim]")
             database.update_discovered_url_status(domain, "failed")
             continue
 
         emails = await email_extractor.extract_emails(url, html)
         if not emails:
+            console.print(f"{prefix}  [dim]·  no emails[/dim]")
             database.update_discovered_url_status(domain, "scraped")
             continue
 
         company_name = _extract_company_name(html, url, site_cfg)
         company_desc = _extract_company_desc(html, site_cfg)
         niche        = _infer_niche(html)
+        n            = len(emails)
+
+        console.print(
+            f"{prefix}  [green]✓  {n} email{'s' if n > 1 else ''}[/green]"
+            f"  [dim]·  {company_name[:28]}[/dim]"
+        )
 
         for email in emails:
             raw_leads.append({
@@ -276,11 +367,12 @@ async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
                 "company_desc": company_desc,
                 "niche":        niche,
             })
-
         database.update_discovered_url_status(domain, "scraped")
 
     console.print()
-    console.print(f"  [green]{len(raw_leads)} raw lead records extracted.[/green]")
+    console.print(
+        f"  [bold green]{len(raw_leads)}[/bold green] [dim]raw lead{'s' if len(raw_leads) != 1 else ''} extracted[/dim]\n"
+    )
     return raw_leads
 
 
