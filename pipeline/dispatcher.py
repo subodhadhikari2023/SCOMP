@@ -26,20 +26,40 @@ _SESSION_FILE = _SESSION_DIR / "state.json"
 _INBOX_URL    = "https://outlook.live.com/mail/0/"
 
 
-async def _wait_for_inbox(page: Page, timeout_ms: int = 8000) -> bool:
-    try:
-        await page.wait_for_selector('[aria-label="New mail"]', timeout=timeout_ms)
-        return True
-    except Exception:
-        return False
+async def _wait_inbox_any_page(context: BrowserContext, timeout_ms: int = 8000) -> bool:
+    """
+    Polls every open tab in the context for the inbox button.
+    Handles both same-tab redirects and logins that open in a new tab.
+    """
+    import time
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        for p in context.pages:
+            try:
+                if await p.locator('[aria-label="New mail"]').count() > 0:
+                    return True
+            except Exception:
+                pass
+        await asyncio.sleep(1.5)
+    return False
+
+
+def _has_display() -> bool:
+    """Returns True if a graphical display is available (Linux/Mac)."""
+    import os
+    return bool(
+        os.getenv("DISPLAY")
+        or os.getenv("WAYLAND_DISPLAY")
+        or os.getenv("TERM_PROGRAM")   # macOS terminal apps
+    )
 
 
 async def ensure_session() -> None:
     """
     Opens a headed browser and waits for the user to log into Outlook.
-    Session is saved automatically once the inbox loads — no button press needed.
-    Called automatically by run_dispatch when no session file exists.
-    Also callable explicitly via: python main.py --setup-sender
+    Polls all tabs — handles Outlook's sign-in redirect opening in a new tab.
+    Session saves automatically once the inbox is detected on any tab.
+    Called automatically by run_dispatch on first run; also via --setup-sender.
     """
     from rich.console import Console
     console = Console()
@@ -56,11 +76,12 @@ async def ensure_session() -> None:
 
         console.print(
             f"\n  [cyan]Log into Outlook as[/cyan] [bold]{settings.SMTP_ADDRESS}[/bold]\n"
-            "  [dim]Session saves automatically once your inbox finishes loading.[/dim]\n"
+            "  [dim]A sign-in tab may open — complete login there. "
+            "Session saves automatically once your inbox loads.[/dim]\n"
         )
 
-        # Wait up to 3 minutes — covers slow connections + MFA
-        if not await _wait_for_inbox(page, timeout_ms=180_000):
+        # Poll all tabs — works whether login redirects in same tab or opens a new one
+        if not await _wait_inbox_any_page(context, timeout_ms=180_000):
             await browser.close()
             raise RuntimeError("Timed out waiting for Outlook inbox. Run --setup-sender to retry.")
 
@@ -119,7 +140,14 @@ async def run_dispatch(progress_callback=None) -> dict:
         return stats
 
     if not _SESSION_FILE.exists():
-        logger.info("No Outlook session — triggering first-time login...")
+        if not _has_display():
+            logger.error(
+                "No Outlook session and no display available. "
+                "Run interactively first: python main.py --setup-sender"
+            )
+            stats["halted"] = True
+            return stats
+        logger.info("No session — opening browser for first-time login...")
         try:
             await ensure_session()
         except Exception as exc:

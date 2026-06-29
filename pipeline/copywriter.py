@@ -30,15 +30,16 @@ def _get_client() -> genai.Client:
     return _client
 
 _SYSTEM_PROMPT = (
-    "You are a technical copywriter writing cold outreach emails for a software "
-    "developer seeking freelance or job opportunities. Output rules:\n"
+    "You are a technical copywriter writing cold outreach emails for a software developer "
+    "offering backend engineering services to businesses. Output rules:\n"
     "- Under 100 words strictly\n"
     "- First person, direct tone\n"
-    "- Specific to the company's domain — no generic claims\n"
+    "- Frame the email as offering value to their business, not asking for a job\n"
+    "- Specific to the company's domain and likely tech pain points\n"
     "- Forbidden phrases: \"I hope\", \"passionate\", \"excited to\", \"leverage\", "
     "\"synergy\", \"innovative\", \"cutting-edge\", \"I wanted to reach out\", "
-    "\"touch base\", \"circle back\"\n"
-    "- End with one clear low-friction call to action\n"
+    "\"touch base\", \"circle back\", \"just checking in\"\n"
+    "- End with one clear low-friction call to action (e.g. a 15-min call)\n"
     "- Return only the email body, nothing else"
 )
 
@@ -49,7 +50,9 @@ _BODY_TEMPLATE = (
     "My stack: Java (Spring Boot), Python, Docker, GitHub Actions CI/CD\n"
     "My work: Internship Management Portal (Angular + Spring Boot + JWT + MySQL),\n"
     "CampusConnect (Railway deployment, Docker, 194 automated tests)\n\n"
-    "Write a cold outreach email for a freelance backend/full-stack opportunity."
+    "Write a cold outreach email offering backend/full-stack development services "
+    "to this business. The recipient may be a founder, CEO, or decision-maker. "
+    "Show you understand their domain and propose a concrete way to help."
 )
 
 _SUBJECT_TEMPLATE = (
@@ -58,7 +61,7 @@ _SUBJECT_TEMPLATE = (
     "- No punctuation at end\n"
     "- Not a question\n"
     "- Reference something specific about their company or industry\n"
-    "- Forbidden: \"Quick question\", \"Following up\", \"Opportunity\", \"Hi\"\n\n"
+    "- Forbidden: \"Quick question\", \"Following up\", \"Opportunity\", \"Hi\", \"Services\"\n\n"
     "Email body: {email_body}\n"
     "Company: {company_name}"
 )
