@@ -42,6 +42,10 @@ SEARCH_ENGINE: str = os.getenv("SEARCH_ENGINE", "bing").lower()
 BROWSER_ENGINE: str = os.getenv("BROWSER_ENGINE", "firefox").lower()
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
+# Flush discovered URLs to DB after this many new entries accumulate in the buffer.
+# Lower = more crash-safe, slightly more DB writes. Higher = fewer writes, more RAM.
+DISCOVERY_FLUSH_EVERY: int = int(os.getenv("DISCOVERY_FLUSH_EVERY", "50"))
+
 HTTP_TIMEOUT: int   = 20    # seconds per request
 MAX_RETRIES: int    = 2
 USER_AGENT: str = (
