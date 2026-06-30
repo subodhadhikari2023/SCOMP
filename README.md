@@ -33,30 +33,117 @@ SCOMP/
 
 ## Quick Start
 
-### 1. Clone and configure
+### Option A — Pull from GHCR (no clone required)
+
+All you need is two files in an empty directory.
+
+**1. Get the compose file**
 
 ```bash
+mkdir scomp && cd scomp
+curl -O https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/docker-compose.yml
+```
+
+**2. Create your `.env`**
+
+```bash
+# Minimum required:
+echo "SMTP_ADDRESS=you@outlook.com" > .env
+
+# Full list of options: see .env.example in the repo
+```
+
+**3. Save your Outlook session (one-time)**
+
+The dispatcher needs a real browser window to log in, so this step requires a display. Run it once before the first `docker compose up`:
+
+- **Linux:**
+  ```bash
+  xhost +local:docker
+  docker run --rm -it \
+    --env-file .env \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v $(pwd)/browser_profiles:/app/browser_profiles \
+    ghcr.io/subodhadhikari2023/scomp:latest \
+    python main.py --setup-sender
+  ```
+
+- **macOS** (requires [XQuartz](https://www.xquartz.org)):
+  ```bash
+  xhost +localhost
+  docker run --rm -it \
+    --env-file .env \
+    -e DISPLAY=host.docker.internal:0 \
+    -v $(pwd)/browser_profiles:/app/browser_profiles \
+    ghcr.io/subodhadhikari2023/scomp:latest \
+    python main.py --setup-sender
+  ```
+
+- **Windows** (requires [VcXsrv](https://sourceforge.net/projects/vcxsrv)):
+  ```powershell
+  docker run --rm -it `
+    --env-file .env `
+    -e DISPLAY=host.docker.internal:0 `
+    -v ${PWD}/browser_profiles:/app/browser_profiles `
+    ghcr.io/subodhadhikari2023/scomp:latest `
+    python main.py --setup-sender
+  ```
+
+Log in and complete any MFA. The session saves to `./browser_profiles/outlook_sender/state.json` and persists for weeks. Re-run this step when the dispatcher reports session expired.
+
+**4. Run the pipeline**
+
+```bash
+docker compose up
+```
+
+The image is pulled from GHCR automatically. The database, logs, and Outlook session persist in local directories via volume mounts — the container can be stopped and restarted safely.
+
+**Other commands:**
+
+```bash
+docker compose run --rm scomp python main.py --summary
+docker compose run --rm scomp python main.py --write
+docker compose run --rm scomp python main.py --send
+```
+
+---
+
+### Option B — Build locally (for customisation)
+
+Clone the repo if you want to edit queries, templates, or selectors and rebuild:
+
+```bash
+git clone https://github.com/subodhadhikari2023/SCOMP.git
 cd SCOMP
 cp .env.example .env
-# Fill in SMTP_ADDRESS (your Outlook address)
+
+docker compose build
+docker compose up
 ```
 
-### 2. Run with Docker (recommended)
+To mount your local config so edits take effect without rebuilding, add this to the `volumes:` section of `docker-compose.yml`:
 
-```bash
-docker-compose up --build
+```yaml
+- ./config:/app/config
 ```
 
-The container runs `--run` (full pipeline) by default and exits when the daily cap is reached.
+---
 
-### 3. Run locally
+### Option C — Run locally without Docker
 
 ```bash
+git clone https://github.com/subodhadhikari2023/SCOMP.git
+cd SCOMP
+cp .env.example .env
+
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install firefox
 
+python main.py --setup-sender   # one-time Outlook login
 python main.py --run
 ```
 

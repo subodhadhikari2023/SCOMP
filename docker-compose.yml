@@ -1,13 +1,13 @@
 services:
   scomp:
-    build: .
+    image: ghcr.io/subodhadhikari2023/scomp:latest
+    build: .   # used only when running: docker compose build
     env_file:
       - .env
     volumes:
       - ./browser_profiles:/app/browser_profiles  # Outlook session state
       - ./logs:/app/logs                          # Rotating log files
       - ./db:/app/db                              # SQLite database
-      - ./config:/app/config                      # YAML configs (edit without rebuild)
     stdin_open: true
     tty: true
     restart: "no"
