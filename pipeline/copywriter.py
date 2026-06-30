@@ -1,158 +1,178 @@
 """
-Copywriter: calls Gemini API to generate personalised email body + subject line.
-Two separate calls per lead. Validates output. Retries once on failure.
-Flags lead after two consecutive failures.
-Uses the google-genai SDK (replaces deprecated google-generativeai).
+Copywriter: assembles personalised cold outreach emails from YAML templates.
+Fully offline — no external API calls.
+
+Assembly per lead
+─────────────────
+  1. opening    niche-specific, rotated by lead_id
+  2. value_prop with_desc variant when company_desc > 50 chars, else general
+  3. cta        rotated by lead_id (offset so it differs from opening rotation)
+
+  body    = opening  +  "\\n\\n"  +  value_prop  +  "\\n\\n"  +  cta
+  subject = subjects[niche][lead_id % pool_size]
+
+Validation
+──────────
+  Word count ≤ EMAIL_BODY_MAX_WORDS and no FORBIDDEN_PHRASES.
+  If validation fails: retry with value_props.short.
+  If still invalid: flag the lead.
 """
 
 import logging
-import time
-from typing import Optional
+from pathlib import Path
 
-from google import genai
-from google.genai import types
+import yaml
 
 from config import settings
 from db import database
 
 logger = logging.getLogger(__name__)
 
-_client: genai.Client | None = None
-_MODEL  = "gemini-2.5-flash"
+_templates: dict | None = None
 
 
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        if not settings.GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not set. Add it to your .env file.")
-        _client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    return _client
+def _load_templates() -> dict:
+    global _templates
+    if _templates is None:
+        path = Path(settings.BASE_DIR) / "config" / "email_templates.yaml"
+        _templates = yaml.safe_load(path.read_text())
+    return _templates
 
-_SYSTEM_PROMPT = (
-    "You are a technical copywriter writing cold outreach emails for a software developer "
-    "offering backend engineering services to businesses. Output rules:\n"
-    "- Under 100 words strictly\n"
-    "- First person, direct tone\n"
-    "- Frame the email as offering value to their business, not asking for a job\n"
-    "- Specific to the company's domain and likely tech pain points\n"
-    "- Forbidden phrases: \"I hope\", \"passionate\", \"excited to\", \"leverage\", "
-    "\"synergy\", \"innovative\", \"cutting-edge\", \"I wanted to reach out\", "
-    "\"touch base\", \"circle back\", \"just checking in\"\n"
-    "- End with one clear low-friction call to action (e.g. a 15-min call)\n"
-    "- Return only the email body, nothing else"
-)
 
-_BODY_TEMPLATE = (
-    "Company: {company}\n"
-    "Industry: {niche}\n"
-    "What they do: {company_desc}\n\n"
-    "My stack: Java (Spring Boot), Python, Docker, GitHub Actions CI/CD\n"
-    "My work: Internship Management Portal (Angular + Spring Boot + JWT + MySQL),\n"
-    "CampusConnect (Railway deployment, Docker, 194 automated tests)\n\n"
-    "Write a cold outreach email offering backend/full-stack development services "
-    "to this business. The recipient may be a founder, CEO, or decision-maker. "
-    "Show you understand their domain and propose a concrete way to help."
-)
+def _pick(pool: list, idx: int) -> str:
+    return pool[idx % len(pool)]
 
-_SUBJECT_TEMPLATE = (
-    "Write a subject line for this cold email:\n"
-    "- Under 8 words\n"
-    "- No punctuation at end\n"
-    "- Not a question\n"
-    "- Reference something specific about their company or industry\n"
-    "- Forbidden: \"Quick question\", \"Following up\", \"Opportunity\", \"Hi\", \"Services\"\n\n"
-    "Email body: {email_body}\n"
-    "Company: {company_name}"
-)
 
-_GEN_CONFIG = types.GenerateContentConfig(
-    temperature=0.7,
-    max_output_tokens=300,
-    system_instruction=_SYSTEM_PROMPT,
-)
+def _render(template: str, lead: dict) -> str:
+    """Fill placeholders; silently ignore unknown keys or malformed company data."""
+    company    = lead.get("company")      or "your company"
+    niche      = lead.get("niche")        or "technology"
+    desc       = lead.get("company_desc") or ""
+    desc_short = (desc[:80].rstrip() + "...") if len(desc) > 80 else desc
+
+    # Sanitise values that could break str.format() if they contain literal braces
+    def _safe(s: str) -> str:
+        return s.replace("{", "{{").replace("}", "}}")
+
+    safe_company    = _safe(company)
+    safe_niche      = _safe(niche)
+    safe_desc       = _safe(desc)
+
+    # desc_short has already been built from desc, so sanitise the same way
+    safe_desc_short = _safe(desc_short)
+
+    # Normalise YAML folded/literal block scalars: collapse internal newlines
+    # that the YAML parser left as-is (folded lines become spaces, not \n)
+    template = " ".join(template.split())
+
+    try:
+        return template.format(
+            company=safe_company,
+            niche=safe_niche,
+            company_desc=safe_desc,
+            company_desc_short=safe_desc_short,
+        )
+    except (KeyError, IndexError, ValueError):
+        # Last-resort: replace manually without format()
+        return (
+            template
+            .replace("{company}", safe_company)
+            .replace("{niche}", safe_niche)
+            .replace("{company_desc_short}", safe_desc_short)
+            .replace("{company_desc}", safe_desc)
+        )
+
+
+def _count_words(text: str) -> int:
+    return len(text.split())
 
 
 def _validate(text: str) -> bool:
-    word_count     = len(text.split())
-    has_forbidden  = any(f in text.lower() for f in settings.FORBIDDEN_PHRASES)
-    return word_count <= settings.EMAIL_BODY_MAX_WORDS and not has_forbidden
-
-
-def _call_gemini(prompt: str) -> Optional[str]:
-    try:
-        response = _get_client().models.generate_content(
-            model=_MODEL,
-            contents=prompt,
-            config=_GEN_CONFIG,
-        )
-        return response.text.strip() if response.text else None
-    except Exception as exc:
-        logger.warning("Gemini API error: %s", exc)
-        return None
-
-
-def _generate_body(lead: dict) -> Optional[str]:
-    prompt = _BODY_TEMPLATE.format(
-        company=lead.get("company", "Unknown"),
-        niche=lead.get("niche") or "technology",
-        company_desc=lead.get("company_desc") or "a technology company",
+    return (
+        _count_words(text) <= settings.EMAIL_BODY_MAX_WORDS
+        and not any(phrase.lower() in text.lower() for phrase in settings.FORBIDDEN_PHRASES)
     )
-    for attempt in range(2):
-        text = _call_gemini(prompt)
-        if text and _validate(text):
-            return text
-        if attempt == 0:
-            logger.debug("Body validation failed — retrying lead_id=%s", lead.get("id"))
-            time.sleep(2)
-    return None
 
 
-def _generate_subject(body: str, company: str) -> Optional[str]:
-    prompt = _SUBJECT_TEMPLATE.format(email_body=body, company_name=company)
-    for attempt in range(2):
-        text = _call_gemini(prompt)
-        if text and len(text.split()) <= 10:
-            return text.rstrip(".!?,;:")
-        if attempt == 0:
-            time.sleep(2)
-    return None
-
-
-def run_copywriting() -> dict:
+def _assemble_body(lead: dict, t: dict) -> tuple[str, bool]:
     """
-    Generates email body + subject for all 'ready' leads.
-    Returns stats: {drafted, flagged, skipped}
+    Returns (body, is_valid).
+    Tries short value_prop on first validation failure before giving up.
+    """
+    niche = lead.get("niche") or "technology"
+    idx   = lead.get("id", 0)
+    desc  = lead.get("company_desc") or ""
+
+    # Opening: prefer niche pool, fall back to "technology"
+    openings = t["openings"].get(niche) or t["openings"]["technology"]
+    opening  = _render(_pick(openings, idx), lead)
+
+    # Value prop pool selection
+    vp_pool = (
+        t["value_props"]["with_desc"]
+        if len(desc) > 50
+        else t["value_props"]["general"]
+    )
+    value_prop = _render(_pick(vp_pool, idx + 1), lead)
+
+    # CTA (offset +2 so the rotation is independent of the opening)
+    cta  = _render(_pick(t["ctas"], idx + 2), lead)
+    body = f"{opening}\n\n{value_prop}\n\n{cta}"
+
+    if _validate(body):
+        return body, True
+
+    # First failure: swap in the shorter value prop variant
+    short_vp = _render(_pick(t["value_props"]["short"], idx), lead)
+    body = f"{opening}\n\n{short_vp}\n\n{cta}"
+    return body, _validate(body)
+
+
+def _assemble_subject(lead: dict, t: dict) -> str:
+    niche    = lead.get("niche") or "technology"
+    idx      = lead.get("id", 0)
+    subjects = t["subjects"].get(niche) or t["subjects"]["technology"]
+    raw      = _render(_pick(subjects, idx + 3), lead)
+    return raw.rstrip(".!?,;:")
+
+
+def run_copywriting(on_draft=None) -> dict:
+    """
+    Draft emails for all 'ready' leads. Returns {drafted, flagged, skipped}.
+    on_draft(company, subject) — optional callback fired per drafted email.
     """
     stats = {"drafted": 0, "flagged": 0, "skipped": 0}
     leads = database.get_leads_by_status("ready")
 
     if not leads:
-        logger.info("No ready leads for copywriting.")
+        logger.debug("No ready leads for copywriting.")
         return stats
 
-    logger.info("Copywriting %d leads...", len(leads))
+    t = _load_templates()
+    logger.info("Copywriting %d leads (template engine)", len(leads))
 
     for lead in leads:
-        lead_dict = dict(lead)
-        lead_id   = lead_dict["id"]
+        ld      = dict(lead)
+        lead_id = ld["id"]
 
-        body = _generate_body(lead_dict)
-        if not body:
-            database.update_lead_status(lead_id, "flagged", "email body generation failed x2")
+        body, valid = _assemble_body(ld, t)
+        subject     = _assemble_subject(ld, t)
+
+        if not valid:
+            logger.warning(
+                "Body failed validation for lead_id=%d (%s) — flagging",
+                lead_id, ld.get("company"),
+            )
+            database.update_lead_status(lead_id, "flagged")
             stats["flagged"] += 1
             continue
 
-        subject = _generate_subject(body, lead_dict.get("company", ""))
-        if not subject:
-            subject = f"Backend developer available — {lead_dict.get('company', 'your team')}"
-
-        database.insert_email(lead_id, subject, body, len(body.split()))
+        database.insert_email(lead_id, subject, body, _count_words(body))
         database.update_lead_status(lead_id, "drafted")
         stats["drafted"] += 1
-        logger.debug("Drafted for lead_id=%d (%s)", lead_id, lead_dict.get("company"))
-
-        time.sleep(1.5)  # free-tier rate limit
+        if on_draft:
+            on_draft(ld.get("company", ""), subject)
+        logger.debug("Drafted lead_id=%d (%s) — %d words", lead_id, ld.get("company"), _count_words(body))
 
     logger.info("Copywriting done: %s", stats)
     return stats
