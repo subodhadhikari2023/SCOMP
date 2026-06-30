@@ -56,6 +56,16 @@ USER_AGENT: str = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# ── Portfolio / proof ─────────────────────────────────────────────────────────
+# When set, a "Code samples available at <URL>" line is appended to every email's
+# value proposition so recipients can verify the project claims independently.
+PORTFOLIO_URL: str = os.getenv("PORTFOLIO_URL", "")
+
+# ── Test mode ─────────────────────────────────────────────────────────────────
+# When set, all outgoing emails are redirected to this address instead of the
+# actual lead recipient. Everything else (scraping, copywriting, DB) runs normally.
+TEST_RECIPIENT_EMAIL: str = os.getenv("TEST_RECIPIENT_EMAIL", "")
+
 # ── Copywriter validation ─────────────────────────────────────────────────────
 EMAIL_BODY_MAX_WORDS: int = 110
 FORBIDDEN_PHRASES = [

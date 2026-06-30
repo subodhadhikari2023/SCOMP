@@ -238,7 +238,16 @@ async def _compose_and_send(
 
         body_el = body_sel
         await body_el.click()
-        await body_el.fill(body)
+        # execCommand preserves line breaks in Outlook's rich-text editor.
+        # fill() sets raw textContent which collapses \n into spaces.
+        await body_el.evaluate(
+            "(el, text) => {"
+            "  el.focus();"
+            "  document.execCommand('selectAll', false, null);"
+            "  document.execCommand('insertText', false, text);"
+            "}",
+            body,
+        )
 
         # Send via keyboard shortcut
         await compose_page.keyboard.press("Control+Enter")
@@ -331,11 +340,17 @@ async def run_dispatch(progress_callback=None) -> dict:
                 logger.info("Daily cap reached mid-run. Stopping.")
                 break
 
-            row = dict(email_row)
+            row     = dict(email_row)
+            send_to = settings.TEST_RECIPIENT_EMAIL or row["recipient_email"]
+            if settings.TEST_RECIPIENT_EMAIL:
+                logger.info(
+                    "TEST MODE: redirecting %s → %s",
+                    row["recipient_email"], send_to,
+                )
             success = await _compose_and_send(
                 page,
                 context,
-                row["recipient_email"],
+                send_to,
                 row["subject"],
                 row["body"],
             )
