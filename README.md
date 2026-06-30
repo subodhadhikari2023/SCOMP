@@ -1,6 +1,8 @@
 # S.C.O.M.P
 ### Stealth Collection, Outreach & Messaging Pipeline
 
+[![Docker Image](https://ghcr-badge.egpl.dev/subodhadhikari2023/scomp/latest_tag?trim=major&label=ghcr.io)](https://github.com/subodhadhikari2023/SCOMP/pkgs/container/scomp)
+
 A self-contained Python CLI automation framework for personalised cold email outreach targeting freelance and job opportunities. Handles the complete pipeline — lead discovery, web scraping, email extraction, template-based copywriting, and regulated drip dispatch — all tracked in a local SQLite database with a Rich terminal dashboard. Fully offline; no third-party LLM or paid API required.
 
 ---
@@ -35,6 +37,12 @@ SCOMP/
 
 ### Option A — Pull from GHCR (no clone required)
 
+The image is public — no `docker login` needed.
+
+```bash
+docker pull ghcr.io/subodhadhikari2023/scomp:latest
+```
+
 **1. Download the compose file and default configs**
 
 ```bash
@@ -43,12 +51,12 @@ mkdir scomp && cd scomp
 curl -O https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/docker-compose.yml
 
 mkdir config
-curl -o config/queries.yaml        https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/queries.yaml
+curl -o config/queries.yaml         https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/queries.yaml
 curl -o config/email_templates.yaml https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/email_templates.yaml
-curl -o config/targets.yaml        https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/targets.yaml
+curl -o config/targets.yaml         https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/targets.yaml
 ```
 
-The config files are volume-mounted into the container, so you can edit them freely — no rebuild needed.
+The config files are volume-mounted into the container. Edit them locally to customise your queries, email copy, and target sites — no rebuild needed.
 
 **2. Create your `.env`**
 
@@ -168,10 +176,12 @@ python main.py --run
 
 ## Configuration
 
-All search queries live in `config/queries.yaml` (520 queries across 10 niches).  
+All search queries live in `config/queries.yaml`.  
 Email copy templates live in `config/email_templates.yaml`.  
 Per-site CSS selectors live in `config/targets.yaml`.  
 All secrets and limits live in `.env` (see `.env.example`).  
+
+The repo ships example/placeholder configs. Replace them with your own queries and copy — they are volume-mounted so changes take effect on the next `docker compose up` without a rebuild.  
 No code changes needed when a site redesigns its HTML — update the YAML selector only.
 
 ---
