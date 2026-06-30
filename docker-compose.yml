@@ -5,6 +5,7 @@ services:
     env_file:
       - .env
     volumes:
+      - ./config:/app/config                      # Your queries, templates, and selectors
       - ./browser_profiles:/app/browser_profiles  # Outlook session state
       - ./logs:/app/logs                          # Rotating log files
       - ./db:/app/db                              # SQLite database
