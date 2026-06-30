@@ -69,7 +69,7 @@ def _setup_logging() -> None:
             lg = logging.getLogger(name)
             lg.addHandler(fh)
 
-    for lib in ("httpx", "httpcore", "playwright", "google_genai", "asyncio"):
+    for lib in ("httpx", "httpcore", "playwright", "asyncio"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 logger = logging.getLogger("scomp.main")
