@@ -26,10 +26,7 @@ from urllib.parse import urlparse
 import yaml
 from bs4 import BeautifulSoup
 from rich.console import Console
-from rich.live import Live
-from rich.panel import Panel
 from rich.prompt import Confirm
-from rich.table import Table
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -38,6 +35,7 @@ from db import database
 from pipeline import copywriter, dispatcher, normalizer
 from scraper import auth_bootstrap, discovery, email_extractor, router
 from ui import dashboard
+from ui.dashboard import PipelineState, PipelineUI, RUNNING, DONE, ERROR
 
 console = Console()
 
@@ -46,14 +44,31 @@ console = Console()
 
 def _setup_logging() -> None:
     os.makedirs(settings.LOG_DIR, exist_ok=True)
-    # All detail goes to the log file; terminal output is handled by Rich UI only
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        handlers=[
-            logging.FileHandler(os.path.join(settings.LOG_DIR, "scomp.log")),
-        ],
-    )
+    fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s  %(message)s")
+
+    # Combined log — everything goes here
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    combined = logging.FileHandler(os.path.join(settings.LOG_DIR, "scomp.log"))
+    combined.setFormatter(fmt)
+    root.addHandler(combined)
+
+    # Per-stage log files — each stage logger also writes to its own file
+    _stage_logs = {
+        "s1_discovery.log":  ["scraper.discovery"],
+        "s24_scrape.log":    ["scraper.email_extractor", "scraper.router", "pipeline.normalizer"],
+        "s5_storage.log":    ["db.database"],
+        "s6_copywriter.log": ["pipeline.copywriter"],
+        "s7_dispatch.log":   ["pipeline.dispatcher"],
+        "main.log":          ["scomp.main"],
+    }
+    for filename, names in _stage_logs.items():
+        fh = logging.FileHandler(os.path.join(settings.LOG_DIR, filename))
+        fh.setFormatter(fmt)
+        for name in names:
+            lg = logging.getLogger(name)
+            lg.addHandler(fh)
+
     for lib in ("httpx", "httpcore", "playwright", "google_genai", "asyncio"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
@@ -69,7 +84,7 @@ def _check_first_boot() -> None:
     lock.touch()
 
     if not sys.stdin.isatty():
-        return  # non-interactive context (piped, CI, Docker) — skip prompt silently
+        return
 
     console.print()
     console.rule("[bold cyan]S.C.O.M.P  —  First-Boot Setup[/bold cyan]")
@@ -146,7 +161,6 @@ def _register_autostart() -> None:
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
 def _get_known_site_config(domain: str, known: dict) -> dict | None:
-    """Returns the YAML config block for a domain if it is a known site."""
     for cfg in known.values():
         site_domain = urlparse(cfg.get("base_url", "")).netloc.lstrip("www.")
         if site_domain and site_domain in domain:
@@ -155,12 +169,10 @@ def _get_known_site_config(domain: str, known: dict) -> dict | None:
 
 
 def _get_site_name(domain: str, known: dict) -> str:
-    """Returns the known site name or derives it from the domain."""
     for name, cfg in known.items():
         site_domain = urlparse(cfg.get("base_url", "")).netloc.lstrip("www.")
         if site_domain and site_domain in domain:
             return name
-    # Auto-derive: wellfound.com → wellfound, jobs.lever.co → lever
     parts = domain.split(".")
     return parts[-2] if len(parts) >= 2 else parts[0]
 
@@ -212,126 +224,177 @@ def _infer_niche(html: str) -> str:
     return "technology"
 
 
-# ── Pipeline stages ────────────────────────────────────────────────────────────
+# ── Queue helpers ─────────────────────────────────────────────────────────────
 
-def _discovery_panel(
-    completed: list,
-    current_query: str,
-    current_page: int,
-    total_pages: int,
-    total_queries: int,
-    total_urls: int,
-    engine: str,
-) -> Panel:
-    """Builds the live Stage 1 panel renderable."""
-    rows = Table.grid(padding=(0, 1))
-    rows.add_column(width=2)
-    rows.add_column(min_width=56, max_width=56)
-    rows.add_column(width=12, justify="right")
-
-    for q, count in completed[-12:]:
-        label = (q[:54] + "..") if len(q) > 56 else q
-        rows.add_row(
-            "[green]✓[/green]",
-            f"[dim]{label}[/dim]",
-            f"[green]{count}[/green] [dim]urls[/dim]",
-        )
-
-    if current_query:
-        label = (current_query[:54] + "..") if len(current_query) > 56 else current_query
-        filled = current_page
-        empty  = total_pages - current_page
-        bar    = f"[cyan]{'█' * filled}[/cyan][dim]{'░' * empty}[/dim]"
-        rows.add_row("[yellow]▶[/yellow]", f"[white]{label}[/white]", bar)
-
-    return Panel(
-        rows,
-        title="[bold white]  Stage 1  ·  Discovery  [/bold white]",
-        subtitle=(
-            f"[dim]engine[/dim] [bold cyan]{engine.upper()}[/bold cyan]"
-            f"[dim]  ·  {len(completed)}/{total_queries} queries  ·  [/dim]"
-            f"[bold green]{total_urls}[/bold green][dim] urls found[/dim]"
-        ),
-        border_style="cyan",
-        padding=(1, 2),
-    )
+_MIN_URL_BUFFER  = 5
+_MIN_LEAD_BUFFER = 3
+_NORMALISE_BATCH = 5
 
 
-async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
-    seen_domains: set = database.load_seen_domains()
-    cfg        = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
-    known      = cfg.get("known_sites", {})
-    disc_cfg   = cfg.get("discovery", {})
-    total_q    = len(disc_cfg.get("search_queries", []))
-    max_pages  = disc_cfg.get("max_pages_per_query", 5)
+async def _buffer_get(
+    queue: asyncio.Queue,
+    min_buffer: int,
+    upstream_done: asyncio.Event,
+) -> dict | None:
+    while True:
+        if upstream_done.is_set():
+            if queue.qsize() > 0:
+                return queue.get_nowait()
+            return None
+        if queue.qsize() > min_buffer:
+            return queue.get_nowait()
+        await asyncio.sleep(0.5)
 
-    # ── Stage 1: Discovery ────────────────────────────────────────────────────
-    state = dict(completed=[], current="", page=0, prev_total=0, total=0)
 
-    def _panel():
-        return _discovery_panel(
-            state["completed"], state["current"], state["page"],
-            max_pages, total_q, state["total"], settings.SEARCH_ENGINE,
-        )
+async def _wait_queue_nonempty(queue: asyncio.Queue, upstream_done: asyncio.Event) -> None:
+    """Returns once the queue has ≥ 1 item, or upstream has finished."""
+    while queue.qsize() == 0 and not upstream_done.is_set():
+        await asyncio.sleep(0.2)
 
-    def on_query_start(query, idx, total):
-        state["current"]    = query
-        state["page"]       = 0
-        state["prev_total"] = state["total"]
-        live.update(_panel())
 
-    def on_page_done(query, page, total_pages, total_urls):
-        state["page"]  = page + 1
-        state["total"] = total_urls
-        live.update(_panel())
+async def _wait_event_or_done(event: asyncio.Event, done: asyncio.Event) -> None:
+    """Returns once event fires, or done is set (upstream finished with nothing)."""
+    while not event.is_set() and not done.is_set():
+        await asyncio.sleep(0.2)
 
-    def on_query_done(query, total_urls):
-        state["completed"].append((query, total_urls - state["prev_total"]))
-        state["current"] = ""
-        state["total"]   = total_urls
-        live.update(_panel())
 
-    console.print()
-    with Live(_panel(), console=console, refresh_per_second=8) as live:
-        urls = await discovery.discover_urls(
-            run_id, seen_domains,
+def _add_stats(total: dict, delta: dict) -> None:
+    for k, v in delta.items():
+        total[k] = total.get(k, 0) + v
+
+
+# ── Stage 1: Discovery (multi-pass) ──────────────────────────────────────────
+#
+# Runs settings.MAX_PASSES rounds of discovery. Each pass starts immediately
+# after the previous one finishes — while Stages 2-7 are still draining the
+# URL/lead queues from the previous pass. s1_done is only set after ALL passes
+# complete so Stage 2-4 keeps consuming without interruption.
+
+async def _stage1(
+    state: PipelineState,
+    ui: PipelineUI,
+    run_id: int,
+    seen_domains: set,
+    url_queue: asyncio.Queue,
+    s1_done: asyncio.Event,
+    disc_cfg: dict,
+) -> None:
+    s          = state.s1
+    total_urls = 0
+    pass_num   = 0
+
+    # Loop passes until the daily email cap is reached — no fixed pass limit.
+    # Between passes, DISCOVERY_PASS_DELAY seconds of cooldown let the search
+    # engine recover from rate-limits and give downstream stages time to drain.
+    while True:
+        pass_num += 1
+
+        if database.count_sent_today() >= settings.DAILY_EMAIL_CAP:
+            logger.info("Daily cap reached — discovery stopping before pass %d.", pass_num)
+            break
+
+        state.pass_num = pass_num
+        s.status  = RUNNING
+        s.note    = f"engine: {settings.SEARCH_ENGINE.upper()} · Pass {pass_num}"
+        s.current = ""
+        ui.refresh()
+
+        _prev_pass_total = total_urls
+
+        def on_queries_ready(queries, _p=pass_num):
+            s.stats["queries"] = s.stats.get("queries", 0) + len(queries)
+            s.current = f"{len(queries)} queries loaded"
+            ui.refresh()
+
+        def on_query_start(query, idx, total, _p=pass_num):
+            nonlocal _prev_pass_total
+            _prev_pass_total = s.stats.get("urls", 0)
+            s.current = query
+            ui.refresh()
+
+        def on_page_done(query, page, total_pages, total_found, _p=pass_num):
+            s.stats["urls"] = total_urls + total_found
+            ui.refresh()
+
+        def on_query_done(query, total_found, _p=pass_num):
+            nonlocal total_urls
+            delta = s.stats.get("urls", 0) - _prev_pass_total
+            s.add_item(f"[P{_p}] {query}", f"+{delta}")
+            state.log_event("S1", f"[P{_p}] {query}", f"+{delta}")
+            s.stats["urls"] = total_urls + total_found
+            s.current = ""
+            ui.refresh()
+
+        await discovery.discover_urls(
+            run_id, seen_domains, url_queue,
+            asyncio.Event(),
+            on_queries_ready=on_queries_ready,
             on_query_start=on_query_start,
             on_page_done=on_page_done,
             on_query_done=on_query_done,
+            put_sentinel=False,
         )
-        state["current"] = ""
-        live.update(_panel())
-    console.print()
 
-    if not urls:
-        console.print("  [yellow]No new URLs discovered.[/yellow]\n")
-        return []
+        total_urls = s.stats.get("urls", total_urls)
+        logger.info("Discovery pass %d done. URLs so far: %d", pass_num, total_urls)
 
-    # ── Stages 2–4: Scraping + Email Extraction ───────────────────────────────
-    console.print(Panel(
-        f"  [dim]Processing[/dim] [bold white]{len(urls)}[/bold white] [dim]URLs[/dim]  ",
-        title="[bold white]  Stages 2–4  ·  Scraping  ·  Extraction  [/bold white]",
-        border_style="cyan",
-        padding=(0, 2),
-    ))
-    console.print()
+        if database.count_sent_today() >= settings.DAILY_EMAIL_CAP:
+            logger.info("Daily cap reached after pass %d — stopping discovery.", pass_num)
+            break
 
-    raw_leads: list[dict] = []
-    dom_w = 44
+        # Cool-down between passes: let rate-limits recover + downstream drain
+        delay = settings.DISCOVERY_PASS_DELAY
+        s.note    = f"Pass {pass_num} done · cooling down {delay}s…"
+        s.current = ""
+        ui.refresh()
+        await asyncio.sleep(delay)
 
-    for i, entry in enumerate(urls, 1):
-        url      = entry["url"]
-        domain   = entry["domain"]
+    s.status  = DONE
+    s.current = ""
+    s.note    = f"{pass_num} pass{'es' if pass_num > 1 else ''} done · {total_urls} URLs total"
+    ui.refresh()
+    s1_done.set()
+    await url_queue.put(None)   # sentinel: Stage 2-4 drains then stops
+
+
+# ── Stages 2–4: Scraping + Email Extraction ───────────────────────────────────
+
+async def _stage24(
+    state: PipelineState,
+    ui: PipelineUI,
+    url_queue: asyncio.Queue,
+    s1_done: asyncio.Event,
+    lead_queue: asyncio.Queue,
+    s4_done: asyncio.Event,
+    known: dict,
+) -> None:
+    s        = state.s24
+    s.status = RUNNING
+    count    = 0
+
+    while True:
+        item = await _buffer_get(url_queue, _MIN_URL_BUFFER, s1_done)
+        if item is None:
+            break
+
+        url      = item["url"]
+        domain   = item["domain"]
         site_cfg = _get_known_site_config(domain, known)
-        prefix   = f"  [dim]{i:>3}/{len(urls)}[/dim]  [white]{domain[:dom_w]:<{dom_w}}[/white]"
+        count   += 1
+
+        s.current           = domain
+        s.stats["scraped"]  = count
+        ui.refresh()
 
         html, track = await router.route(url)
 
         if track == "auth_required":
-            console.print(f"{prefix}  [yellow]⚠  auth required[/yellow]")
+            s.note = f"⚠ auth: {domain}"
+            ui.refresh()
             site_name   = _get_site_name(domain, known)
             profile_dir = os.path.join(settings.BROWSER_PROFILES_DIR, site_name)
-            resolved    = await auth_bootstrap.handle_auth_site(site_name, url, profile_dir)
+            resolved    = await auth_bootstrap.handle_auth_site(site_name, url, profile_dir, ui)
+            s.note = ""
             if resolved:
                 html, track = await router.route(url, profile_dir)
             else:
@@ -339,14 +402,18 @@ async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
                 continue
 
         if not html:
-            console.print(f"{prefix}  [dim]✗  no content[/dim]")
+            s.add_item(domain, "no content")
+            state.log_event("S2-4", domain, "no content")
             database.update_discovered_url_status(domain, "failed")
+            ui.refresh()
             continue
 
         emails = await email_extractor.extract_emails(url, html)
         if not emails:
-            console.print(f"{prefix}  [dim]·  no emails[/dim]")
+            s.add_item(domain, "no emails")
+            state.log_event("S2-4", domain, "no emails")
             database.update_discovered_url_status(domain, "scraped")
+            ui.refresh()
             continue
 
         company_name = _extract_company_name(html, url, site_cfg)
@@ -354,69 +421,253 @@ async def _run_discovery_and_scraping(run_id: int) -> list[dict]:
         niche        = _infer_niche(html)
         n            = len(emails)
 
-        console.print(
-            f"{prefix}  [green]✓  {n} email{'s' if n > 1 else ''}[/green]"
-            f"  [dim]·  {company_name[:28]}[/dim]"
-        )
+        s.add_item(company_name, f"{n} email{'s' if n > 1 else ''}")
+        state.log_event("S2-4", company_name, f"{n} email{'s' if n > 1 else ''}")
+        s.stats["emails"] = s.stats.get("emails", 0) + n
+        database.update_discovered_url_status(domain, "scraped")
+        ui.refresh()
 
         for email in emails:
-            raw_leads.append({
+            await lead_queue.put({
                 "company":      company_name,
                 "email":        email,
                 "source_url":   url,
                 "company_desc": company_desc,
                 "niche":        niche,
             })
-        database.update_discovered_url_status(domain, "scraped")
 
-    console.print()
-    console.print(
-        f"  [bold green]{len(raw_leads)}[/bold green] [dim]raw lead{'s' if len(raw_leads) != 1 else ''} extracted[/dim]\n"
-    )
-    return raw_leads
+    s.status  = DONE
+    s.current = ""
+    ui.refresh()
+    s4_done.set()
+    lead_queue.put_nowait(None)
+
+
+# ── Stage 5: Normalisation ────────────────────────────────────────────────────
+
+async def _stage5(
+    state: PipelineState,
+    ui: PipelineUI,
+    lead_queue: asyncio.Queue,
+    s4_done: asyncio.Event,
+    s5_done: asyncio.Event,
+    s5_first_stored: asyncio.Event | None = None,
+) -> None:
+    s        = state.s5
+    s.status = RUNNING
+    batch: list[dict] = []
+    total: dict       = {}
+
+    while True:
+        item = await _buffer_get(lead_queue, _MIN_LEAD_BUFFER, s4_done)
+        if item is None:
+            if batch:
+                _add_stats(total, await asyncio.to_thread(normalizer.normalize_and_store, batch))
+            break
+
+        batch.append(item)
+        s.current = item.get("company", "")
+        s.stats["queued"] = s.stats.get("queued", 0) + 1
+        ui.refresh()
+
+        if len(batch) >= _NORMALISE_BATCH:
+            res = await asyncio.to_thread(normalizer.normalize_and_store, batch.copy())
+            _add_stats(total, res)
+            n_stored = res.get("stored", 0)
+            if n_stored:
+                state.log_event("S5", "batch stored", f"+{n_stored}")
+                if s5_first_stored and not s5_first_stored.is_set():
+                    s5_first_stored.set()
+            batch.clear()
+            s.stats["stored"] = total.get("stored", 0)
+            s.stats["dups"]   = total.get("skipped_duplicate", 0)
+            ui.refresh()
+
+    s.status  = DONE
+    s.current = ""
+    s.stats   = {
+        "stored": total.get("stored", 0),
+        "dups":   total.get("skipped_duplicate", 0),
+    }
+    ui.refresh()
+    s5_done.set()
+
+
+# ── Stage 6: Copywriting ──────────────────────────────────────────────────────
+
+async def _stage6(
+    state: PipelineState,
+    ui: PipelineUI,
+    s5_done: asyncio.Event,
+    s6_done: asyncio.Event,
+    s6_first_draft: asyncio.Event | None = None,
+) -> None:
+    s             = state.s6
+    s.status      = RUNNING
+    drafted_total = 0
+    flagged_total = 0
+
+    def on_draft(company: str, subject: str) -> None:
+        nonlocal drafted_total
+        state.log_event("S6", company, "drafted")
+        state.s6.current = company
+        if s6_first_draft and not s6_first_draft.is_set():
+            s6_first_draft.set()
+        ui.refresh()
+
+    while True:
+        stats = await asyncio.to_thread(copywriter.run_copywriting, on_draft)
+        if stats["drafted"] > 0:
+            drafted_total      += stats["drafted"]
+            s.stats["drafted"]  = drafted_total
+        if stats.get("flagged", 0) > 0:
+            flagged_total      += stats["flagged"]
+            s.stats["flagged"]  = flagged_total
+
+        s.current = f"{drafted_total} drafted"
+        ui.refresh()
+
+        if s5_done.is_set():
+            remaining = await asyncio.to_thread(database.get_leads_by_status, "ready")
+            if not remaining:
+                break
+        await asyncio.sleep(3.0)
+
+    s.status  = DONE
+    s.current = ""
+    ui.refresh()
+    s6_done.set()
+
+
+# ── Stage 7: Dispatch ─────────────────────────────────────────────────────────
+
+async def _stage7(
+    state: PipelineState,
+    ui: PipelineUI,
+    s6_done: asyncio.Event,
+) -> None:
+    """
+    Polls for drafted emails and dispatches them in batches.
+    Runs concurrently with S6 — starts as soon as the first email is drafted,
+    continues until the daily cap is reached or the pipeline drains completely.
+    """
+    s = state.s7
+    s.status  = RUNNING
+    s.current = "waiting for drafts…"
+    ui.refresh()
+
+    total_skipped = 0
+
+    def on_progress(sent: int, cap: int,
+                    recipient: str = "", company: str = "") -> None:
+        s.stats["sent"] = sent
+        s.stats["cap"]  = cap
+        s.current       = f"{sent} / {cap} sent"
+        if recipient:
+            s.add_item(recipient, "sent ✓")
+            state.log_event("S7", recipient, f"sent ({company[:18]})" if company else "sent ✓")
+        ui.refresh()
+
+    while True:
+        drafted = await asyncio.to_thread(database.get_drafted_emails)
+
+        if drafted:
+            s.current = f"dispatching {len(drafted)} email(s)…"
+            ui.refresh()
+            stats = await dispatcher.run_dispatch(progress_callback=on_progress)
+            total_skipped += stats.get("skipped", 0)
+            s.stats = {
+                "sent":    database.count_sent_today(),
+                "skipped": total_skipped,
+            }
+            if stats.get("halted"):
+                s.note   = "⚠ session expired — run --setup-sender"
+                s.status = ERROR
+                ui.refresh()
+                break
+            if database.count_sent_today() >= settings.DAILY_EMAIL_CAP:
+                s.note = "daily cap reached ✓"
+                break
+
+        # Stop when S6 is fully done and nothing left to send
+        if s6_done.is_set():
+            remaining = await asyncio.to_thread(database.get_drafted_emails)
+            if not remaining:
+                break
+
+        await asyncio.sleep(30.0)
+
+    s.status  = DONE
+    s.current = ""
+    ui.refresh()
 
 
 # ── Run modes ──────────────────────────────────────────────────────────────────
 
 async def cmd_run() -> None:
-    # Re-prompt any sites that timed out in previous runs
     await auth_bootstrap.handle_pending_auth_sites()
 
-    run_id = database.start_run()
-    stats  = {"leads_attempted": 0, "emails_sent": 0, "emails_skipped": 0, "emails_flagged": 0}
+    run_id       = database.start_run()
+    seen_domains = database.load_seen_domains()
+    cfg          = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
+    known        = cfg.get("known_sites", {})
+    disc_cfg     = cfg.get("discovery", {})
 
-    raw_leads = await _run_discovery_and_scraping(run_id)
-    stats["leads_attempted"] = len(raw_leads)
+    url_queue  = asyncio.Queue(maxsize=50)
+    lead_queue = asyncio.Queue(maxsize=20)
+    s1_done    = asyncio.Event()
+    s4_done    = asyncio.Event()
+    s5_done    = asyncio.Event()
+    s6_done    = asyncio.Event()
 
-    console.rule("[cyan]Stage 5 — Normalisation[/cyan]")
-    norm = normalizer.normalize_and_store(raw_leads)
-    console.print(
-        f"  Stored: {norm['stored']}  "
-        f"Duplicates: {norm['skipped_duplicate']}  "
-        f"Invalid: {norm['skipped_invalid']}  "
-        f"Manual: {norm['flagged_manual']}"
-    )
+    # Cascade trigger events — each fires when a stage produces its first output
+    s5_first_stored = asyncio.Event()
+    s6_first_draft  = asyncio.Event()
 
-    console.rule("[cyan]Stage 6 — Copywriting[/cyan]")
-    copy = copywriter.run_copywriting()
-    stats["emails_flagged"] = copy["flagged"]
-    console.print(f"  Drafted: {copy['drafted']}  Flagged: {copy['flagged']}")
+    state = PipelineState(pass_num=1, run_id=run_id)
+    state.url_queue      = url_queue
+    state.lead_queue     = lead_queue
+    state.url_queue_cap  = 50
+    state.lead_queue_cap = 20
 
-    console.rule("[cyan]Stage 7 — Dispatch[/cyan]")
-    dispatch = await dispatcher.run_dispatch(
-        progress_callback=lambda sent, cap: console.print(f"  Sent {sent}/{cap}", end="\r")
-    )
-    stats["emails_sent"]    = dispatch["sent"]
-    stats["emails_skipped"] = dispatch["skipped"]
-    console.print()
+    async with PipelineUI(state) as ui:
+        # ── Cascade startup ───────────────────────────────────────────────────
+        # Each stage is created only after its predecessor puts data in the
+        # shared buffer. Once started, all active stages run concurrently.
 
-    database.finish_run(run_id, **stats)
+        # S1: start immediately
+        t1 = asyncio.create_task(
+            _stage1(state, ui, run_id, seen_domains, url_queue, s1_done, disc_cfg)
+        )
+
+        # S2-4: start when S1 puts first URL in url_queue
+        await _wait_queue_nonempty(url_queue, s1_done)
+        t24 = asyncio.create_task(
+            _stage24(state, ui, url_queue, s1_done, lead_queue, s4_done, known)
+        )
+
+        # S5: start when S2-4 puts first lead in lead_queue
+        await _wait_queue_nonempty(lead_queue, s4_done)
+        t5 = asyncio.create_task(
+            _stage5(state, ui, lead_queue, s4_done, s5_done, s5_first_stored)
+        )
+
+        # S6: start when S5 stores first lead to DB (ready table)
+        await _wait_event_or_done(s5_first_stored, s5_done)
+        t6 = asyncio.create_task(
+            _stage6(state, ui, s5_done, s6_done, s6_first_draft)
+        )
+
+        # S7: start when S6 drafts first email (drafted table)
+        await _wait_event_or_done(s6_first_draft, s6_done)
+        t7 = asyncio.create_task(
+            _stage7(state, ui, s6_done)
+        )
+
+        await asyncio.gather(t1, t24, t5, t6, t7)
+
+    database.finish_run(run_id)
     console.rule("[bold green]Run Complete[/bold green]")
-    console.print(
-        f"  Sent: {stats['emails_sent']}  "
-        f"Skipped: {stats['emails_skipped']}  "
-        f"Flagged: {stats['emails_flagged']}"
-    )
 
     if database.count_sent_today() >= settings.DAILY_EMAIL_CAP:
         console.print("\n  [bold yellow]Daily cap reached. Shutting down.[/bold yellow]")
@@ -425,15 +676,41 @@ async def cmd_run() -> None:
 
 async def cmd_discover() -> None:
     await auth_bootstrap.handle_pending_auth_sites()
-    run_id    = database.start_run()
-    raw_leads = await _run_discovery_and_scraping(run_id)
-    console.rule("[cyan]Stage 5 — Normalisation[/cyan]")
-    norm = normalizer.normalize_and_store(raw_leads)
-    console.print(
-        f"  Stored: {norm['stored']}  "
-        f"Duplicates: {norm['skipped_duplicate']}  "
-        f"Invalid: {norm['skipped_invalid']}"
-    )
+
+    run_id       = database.start_run()
+    seen_domains = database.load_seen_domains()
+    cfg          = yaml.safe_load(Path(settings.TARGETS_YAML).read_text())
+    known        = cfg.get("known_sites", {})
+    disc_cfg     = cfg.get("discovery", {})
+
+    url_queue  = asyncio.Queue(maxsize=50)
+    lead_queue = asyncio.Queue(maxsize=20)
+    s1_done    = asyncio.Event()
+    s4_done    = asyncio.Event()
+    s5_done    = asyncio.Event()
+
+    state = PipelineState(pass_num=1, run_id=run_id)
+    state.url_queue      = url_queue
+    state.lead_queue     = lead_queue
+    state.url_queue_cap  = 50
+    state.lead_queue_cap = 20
+
+    async with PipelineUI(state) as ui:
+        t1 = asyncio.create_task(
+            _stage1(state, ui, run_id, seen_domains, url_queue, s1_done, disc_cfg)
+        )
+        await _wait_queue_nonempty(url_queue, s1_done)
+        t24 = asyncio.create_task(
+            _stage24(state, ui, url_queue, s1_done, lead_queue, s4_done, known)
+        )
+        await _wait_queue_nonempty(lead_queue, s4_done)
+        t5 = asyncio.create_task(
+            _stage5(state, ui, lead_queue, s4_done, s5_done)
+        )
+        await asyncio.gather(t1, t24, t5)
+
+    database.finish_run(run_id)
+    console.rule("[bold green]Discovery Complete[/bold green]")
 
 
 def cmd_write() -> None:
@@ -459,10 +736,6 @@ def cmd_dashboard() -> None:
 
 
 async def cmd_setup_sender() -> None:
-    """
-    Explicit Outlook Web login — useful for refreshing an expired session.
-    On first --run or --send this is triggered automatically; no need to call it manually.
-    """
     console.rule("[cyan]Outlook Sender Setup[/cyan]")
     try:
         await dispatcher.ensure_session()
@@ -490,7 +763,8 @@ def main() -> None:
     group.add_argument("--dashboard", action="store_true", help="Live terminal dashboard")
     group.add_argument("--summary",   action="store_true", help="Today's run snapshot")
     group.add_argument("--setup",         action="store_true", help="Re-run first-boot setup wizard")
-    group.add_argument("--setup-sender",  action="store_true", help="One-time Outlook Web login — saves session for silent dispatch")
+    group.add_argument("--setup-sender",  action="store_true",
+                       help="One-time Outlook Web login — saves session for silent dispatch")
     args = parser.parse_args()
 
     if args.run:
