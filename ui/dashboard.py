@@ -5,11 +5,10 @@ Screen layout (full-terminal, refreshes every 250 ms)
 ──────────────────────────────────────────────────────
   ┌ header (4 rows) ──────────────────────────────────────────────────────────────┐
   │  title · sub · version  /  run# · pass · elapsed · clock · cap bar           │
-  ├ queue buffers (4 rows) ───────────────────────────────────────────────────────┤
-  │  URL Queue  [████████░░░░░░░░░░░░░░░░░░░░░░]  18/50                          │
-  │  Lead Queue [████░░░░░░░░░░░░░░░░░░░░░░░░░░]   4/20                          │
-  ├ stage cards (5 equal columns, 11 rows) ────────────────────────────────────────┤
-  │  S1 Discovery │ S2-4 Scraping │ S5 Normalise │ S6 Copywrite │ S7 Dispatch    │
+  ├ flow row 1 (11 rows) ─────────────────────────────────────────────────────────┤
+  │  S1 Discovery  │  ████████████████░░░░░░░░░ URL Queue 18/50  │  S2-4 Scraping │
+  ├ flow row 2 (9 rows) ──────────────────────────────────────────────────────────┤
+  │  ████░░░░░░░░░░ Lead Queue 4/20  │  S5 Normalise  │  S6 Copywrite  │  S7 Dispatch │
   ├ live events (remaining rows, min 4) ──────────────────────────────────────────┤
   │  HH:MM:SS  STAGE  text…                                           badge       │
   └ prompt zone (only when a question is pending) ────────────────────────────────┘
@@ -139,20 +138,22 @@ def _bar_markup(filled: int, total: int, width: int) -> str:
 
 # ── Panel renderers ────────────────────────────────────────────────────────────
 
-def _queue_bar_panel(state: PipelineState) -> Panel:
-    url_sz  = state.url_queue.qsize()  if state.url_queue  else 0
-    lead_sz = state.lead_queue.qsize() if state.lead_queue else 0
-    ucap    = state.url_queue_cap
-    lcap    = state.lead_queue_cap
+def _buf_panel_h(label: str, filled: int, cap: int, per_row: int) -> Panel:
+    """Horizontal buffer panel: one █/░ per queue slot, arranged in rows of per_row."""
+    pct   = filled / cap if cap else 0.0
+    color = "green" if pct < 0.5 else ("yellow" if pct < 0.8 else "red")
 
-    url_bar  = _bar_markup(url_sz,  ucap,  34)
-    lead_bar = _bar_markup(lead_sz, lcap,  22)
+    body = Text(justify="center")
+    for slot in range(cap):
+        if slot > 0 and slot % per_row == 0:
+            body.append("\n")
+        body.append(
+            "█" if slot < filled else "░",
+            style=f"bold {color}" if slot < filled else "dim",
+        )
+    body.append(f"\n{filled} / {cap}", style="dim")
 
-    body = Text.from_markup(
-        f"  URL Queue   [{url_bar}]  {url_sz}/{ucap}\n"
-        f"  Lead Queue  [{lead_bar}]  {lead_sz}/{lcap}"
-    )
-    return Panel(body, title="[bold]Queue Buffers[/bold]",
+    return Panel(body, title=f"[dim]{label}[/dim]",
                  border_style="dim", padding=(0, 1))
 
 
@@ -184,8 +185,8 @@ def _stage_card(st: StageState) -> Panel:
 
     tbl.add_row("", "", "")  # spacer
 
-    # Recent items (last 3)
-    for text, badge in st.items[-3:]:
+    # Recent items (all kept, up to maxkeep)
+    for text, badge in st.items[-5:]:
         t = (text[:16] + "…") if len(text) > 17 else text
         b = badge[:7]
         tbl.add_row("[dim]·[/dim]", f"[dim]{t}[/dim]", f"[dim]{b}[/dim]")
@@ -299,21 +300,34 @@ def build_layout(state: PipelineState) -> Layout:
         padding=(0, 2),
     )
 
-    cards_row = Layout(name="cards_row")
-    cards_row.split_row(
-        Layout(_stage_card(state.s1),  name="s1"),
-        Layout(_stage_card(state.s24), name="s24"),
-        Layout(_stage_card(state.s5),  name="s5"),
-        Layout(_stage_card(state.s6),  name="s6"),
-        Layout(_stage_card(state.s7),  name="s7"),
+    url_sz  = state.url_queue.qsize()  if state.url_queue  else 0
+    lead_sz = state.lead_queue.qsize() if state.lead_queue else 0
+    ucap    = state.url_queue_cap
+    lcap    = state.lead_queue_cap
+
+    # Row 1 — S1 Discovery → URL Queue → S2-4 Scraping
+    row1 = Layout(name="row1")
+    row1.split_row(
+        Layout(_stage_card(state.s1),                          name="s1",      ratio=2),
+        Layout(_buf_panel_h("URL Queue", url_sz, ucap, 25),   name="url_buf", ratio=3),
+        Layout(_stage_card(state.s24),                         name="s24",     ratio=2),
+    )
+
+    # Row 2 — Lead Queue → S5 Normalise → S6 Copywrite → S7 Dispatch
+    row2 = Layout(name="row2")
+    row2.split_row(
+        Layout(_buf_panel_h("Lead Queue", lead_sz, lcap, 20), name="lead_buf", ratio=3),
+        Layout(_stage_card(state.s5),                          name="s5",       ratio=2),
+        Layout(_stage_card(state.s6),                          name="s6",       ratio=1),
+        Layout(_stage_card(state.s7),                          name="s7",       ratio=1),
     )
 
     layout   = Layout()
     sections = [
-        Layout(header,                  name="header",  size=4),
-        Layout(_queue_bar_panel(state), name="queues",  size=4),
-        Layout(cards_row,               name="cards",   size=11),
-        Layout(_events_panel(state),    name="events",  minimum_size=4),
+        Layout(header,               name="header", size=4),
+        Layout(row1,                 name="row1",   size=11),
+        Layout(row2,                 name="row2",   size=9),
+        Layout(_events_panel(state), name="events", minimum_size=4),
     ]
 
     if state.prompt_lines:
@@ -339,7 +353,8 @@ class PipelineUI:
     Async context manager: owns the Live display for the pipeline run.
 
     ui.refresh()              — immediate re-render (call after any state mutation)
-    await ui.ask(lines, lbl)  — pause live, read user input, resume; returns str
+    await ui.ask(prompt, lbl) — pause live, read user input, resume; returns str.
+                                prompt may be list[str] or any Rich renderable.
     """
 
     def __init__(self, state: PipelineState):
@@ -378,15 +393,21 @@ class PipelineUI:
         if self._live:
             self._live.update(build_layout(self.state))
 
-    async def ask(self, prompt_lines: list[str], input_label: str = "  → ") -> str:
-        """Pause the live display, collect user input, then resume."""
-        self.state.prompt_lines = prompt_lines
+    async def ask(self, prompt, input_label: str = "  → ") -> str:
+        """
+        Pause the live display, collect user input, then resume.
+        prompt: list[str] for simple text lines, or any Rich renderable (Panel etc).
+        """
+        self.state.prompt_lines = prompt if isinstance(prompt, list) else ["  Awaiting response…"]
         self.refresh()
 
         async with self._lock:
             self._live.stop()
             console.print()
-            console.print(_prompt_panel(prompt_lines))
+            if isinstance(prompt, list):
+                console.print(_prompt_panel(prompt))
+            else:
+                console.print(prompt)
             response = await asyncio.to_thread(input, input_label)
             console.print()
             self._live.start(refresh=True)

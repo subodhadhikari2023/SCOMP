@@ -15,8 +15,10 @@ import os
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
-from rich.console import Console
+import rich.box as box
+from rich.console import Console, Group
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from config import settings
@@ -38,27 +40,90 @@ def _derive_site_name(domain: str) -> str:
     return parts[-2] if len(parts) >= 2 else parts[0]
 
 
-def _prompt_panel(title: str, lines: list[str]) -> Panel:
-    body = Text()
-    for ln in lines:
-        body.append(ln + "\n")
-    return Panel(body, title=f"[bold yellow]{title}[/bold yellow]", border_style="yellow", padding=(0, 2))
+def _site_panel(
+    site_name: str,
+    domain: str,
+    options: list[tuple[str, str]],
+    *,
+    info: str = "",
+    attempts: int = 0,
+    total_sites: int = 0,
+    site_index: int = 0,
+) -> Panel:
+    """
+    Build a clean, structured auth prompt panel.
+
+      ┌─ ⚡  Auth Required ─────────────────────────────────────────┐
+      │  LinkedIn  (linkedin.com)   [1 / 3]                         │
+      │  Skipped 2× — 2 more skips before auto-permanent skip       │
+      │                                                              │
+      │  This site requires login to scrape job listings.           │
+      │                                                              │
+      │  [ y ]   Login now (opens browser)                          │
+      │  [ s ]   Skip this run                                       │
+      │  [ n ]   Never ask again                                     │
+      └──────────────────────────────────────────────────────────────┘
+    """
+    # ── Header line ───────────────────────────────────────────────
+    header = Text()
+    header.append(site_name, style="bold white")
+    header.append(f"  ({domain})", style="dim")
+    if total_sites > 0:
+        header.append(f"   [{site_index} / {total_sites}]", style="dim cyan")
+    header.append("\n")
+
+    # ── Attempts warning ──────────────────────────────────────────
+    if attempts > 0:
+        remaining = PERM_SKIP_AFTER - attempts - 1
+        if remaining <= 0:
+            header.append(
+                f"  Skipped {attempts}× — last chance before permanent auto-skip\n",
+                style="bold red",
+            )
+        else:
+            header.append(
+                f"  Skipped {attempts}× — {remaining} more skip(s) before auto-permanent skip\n",
+                style="yellow",
+            )
+
+    # ── Body info ─────────────────────────────────────────────────
+    body_text = Text()
+    if info:
+        body_text.append(f"\n  {info}\n")
+
+    # ── Options table ─────────────────────────────────────────────
+    opt_tbl = Table.grid(padding=(0, 2))
+    opt_tbl.add_column(width=5,  no_wrap=True)
+    opt_tbl.add_column(ratio=1,  no_wrap=True)
+    opt_tbl.add_row("", "")   # spacer row
+    for key, desc in options:
+        opt_tbl.add_row(
+            f"[bold cyan][ {key} ][/bold cyan]",
+            desc,
+        )
+
+    return Panel(
+        Group(header, body_text, opt_tbl),
+        title="[bold yellow]⚡  Auth Required[/bold yellow]",
+        border_style="yellow",
+        padding=(0, 2),
+    )
 
 
-def _plain_ask(prompt_lines: list[str], input_label: str = "  → ") -> str:
-    """Show a Rich-styled prompt and read from stdin (blocking). No timeout."""
+def _plain_ask(prompt, input_label: str = "  → ") -> str:
+    """Print a Rich renderable prompt and read from stdin (blocking)."""
     console.print()
-    console.print(_prompt_panel("⚡  Auth Required", prompt_lines))
+    console.print(prompt)
     return input(input_label).strip().lower()
 
 
 async def _async_ask(
     ui: "PipelineUI",
-    prompt_lines: list[str],
+    prompt,
     input_label: str = "  → ",
 ) -> str:
     """Route through PipelineUI.ask so the live dashboard pauses properly."""
-    return await ui.ask(prompt_lines, input_label)
+    return await ui.ask(prompt, input_label)
 
 
 # ── Core handler ──────────────────────────────────────────────────────────────
@@ -84,20 +149,20 @@ async def handle_auth_site(
         logger.info("Saved session found for %s — reusing.", site_name)
         return True
 
-    prompt_lines = [
-        f"[bold]{site_name}[/bold]  ({domain})",
-        "",
-        "  This site requires a login to scrape job listings.",
-        "",
-        "  [bold white][ y ][/bold white]  Login now",
-        "  [bold white][ s ][/bold white]  Skip this run",
-        "  [bold white][ n ][/bold white]  Never ask again",
-    ]
+    panel = _site_panel(
+        site_name, domain,
+        info="This site requires login to scrape job listings.",
+        options=[
+            ("y", "Login now  (opens browser)"),
+            ("s", "Skip this run"),
+            ("n", "Never ask again"),
+        ],
+    )
 
     if ui is not None:
-        response = await _async_ask(ui, prompt_lines)
+        response = await _async_ask(ui, panel)
     else:
-        response = _plain_ask(prompt_lines)
+        response = _plain_ask(panel)
 
     if response in ("n", "no", "never"):
         database.add_skipped_site(domain, "user has no account")
@@ -133,11 +198,14 @@ async def _collect_credentials_and_login(
     env_key_pass  = f"{site_name.upper()}_PASSWORD"
 
     if ui is not None:
-        email = await _async_ask(ui, [f"[bold]{site_name}[/bold] — enter your email address:"], "  Email → ")
+        email = await _async_ask(
+            ui,
+            [f"[bold]{site_name}[/bold] — enter your email address:"],
+            "  Email → ",
+        )
         if not email:
             database.add_pending_auth_site(domain, site_url, site_name)
             return False
-        # getpass doesn't work well through async; use sync input with echo-off note
         console.print("  [dim]Enter password (input hidden — type and press Enter):[/dim]")
         password = await __import__("asyncio").to_thread(getpass.getpass, "  Password → ")
     else:
@@ -171,44 +239,69 @@ async def _collect_credentials_and_login(
 async def handle_pending_auth_sites() -> None:
     """
     Called at the beginning of every run, before the live dashboard starts.
-    Uses plain console output (no PipelineUI needed).
+    Shows a summary table of all pending sites, then prompts for each in turn.
     Sites skipped >= PERM_SKIP_AFTER total times are auto-permanently-skipped.
     """
     pending = database.get_pending_auth_sites()
     if not pending:
         return
 
+    n = len(pending)
     console.print()
-    console.rule("[bold cyan]Pending Auth Sites[/bold cyan]")
-    console.print(
-        f"\n  [bold]{len(pending)}[/bold] site(s) need attention before this run starts.\n"
-        "  These sites require login and were skipped in previous runs.\n"
-    )
 
-    for row in pending:
+    # ── Summary table ─────────────────────────────────────────────────────────
+    summary = Table(
+        title=f"[bold cyan]{n} site(s) need login before this run[/bold cyan]",
+        box=box.SIMPLE_HEAD,
+        border_style="dim",
+        show_footer=False,
+        pad_edge=True,
+    )
+    summary.add_column("#",       style="dim",        width=3,  justify="right")
+    summary.add_column("Site",    style="bold white",  min_width=12)
+    summary.add_column("Domain",  style="dim",         min_width=20)
+    summary.add_column("Skips",   justify="right",     width=6)
+    summary.add_column("Status",  min_width=30)
+
+    for i, row in enumerate(pending, 1):
+        attempts  = row["attempts"]
+        remaining = PERM_SKIP_AFTER - attempts - 1
+        if remaining <= 0:
+            status_cell = "[bold red]Last chance — auto-skips next[/bold red]"
+        else:
+            status_cell = f"[dim]{remaining} more skip(s) until auto-permanent[/dim]"
+        summary.add_row(
+            str(i),
+            row["site_name"] or _derive_site_name(row["domain"]),
+            row["domain"],
+            str(attempts),
+            status_cell,
+        )
+
+    console.print(summary)
+    console.print()
+
+    # ── Per-site prompts ──────────────────────────────────────────────────────
+    for i, row in enumerate(pending, 1):
         domain    = row["domain"]
         site_url  = row["site_url"]
         site_name = row["site_name"] or _derive_site_name(domain)
         attempts  = row["attempts"]
         profile_dir = os.path.join(settings.BROWSER_PROFILES_DIR, site_name)
 
-        remaining = PERM_SKIP_AFTER - attempts - 1  # skips left before auto-permanent
+        panel = _site_panel(
+            site_name, domain,
+            options=[
+                ("y", "Login now  (opens browser)"),
+                ("l", "Later  (keep in queue)"),
+                ("n", "Never ask again  (permanent skip)"),
+            ],
+            attempts=attempts,
+            total_sites=n,
+            site_index=i,
+        )
 
-        prompt_lines = [
-            f"[bold]{site_name}[/bold]  ({domain})",
-            f"  Skipped [bold yellow]{attempts}[/bold yellow] time(s) · "
-            + (
-                f"[dim]auto-skip after [bold]{remaining}[/bold] more[/dim]"
-                if remaining > 0 else
-                "[bold red]last chance before permanent skip[/bold red]"
-            ),
-            "",
-            "  [bold white][ y ][/bold white]  Login now",
-            "  [bold white][ l ][/bold white]  Later (keep in queue)",
-            "  [bold white][ n ][/bold white]  Never ask again (permanent skip)",
-        ]
-
-        response = _plain_ask(prompt_lines)
+        response = _plain_ask(panel)
 
         if response in ("n", "no", "never"):
             database.add_skipped_site(domain, "user explicitly declined after repeated prompts")
@@ -224,7 +317,7 @@ async def handle_pending_auth_sites() -> None:
                 console.print("  [dim]→ Login incomplete. Kept in queue.[/dim]\n")
             continue
 
-        # 'l' / 'later' / timeout / skip → re-queue with incremented attempt
+        # 'l' / 'later' / anything else → re-queue with incremented attempt
         database.add_pending_auth_site(domain, site_url, site_name)
         new_attempts = database.get_pending_auth_site_attempts(domain)
 
