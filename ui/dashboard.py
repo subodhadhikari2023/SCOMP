@@ -5,10 +5,14 @@ Screen layout (full-terminal, refreshes every 250 ms)
 ──────────────────────────────────────────────────────
   ┌ header (4 rows) ──────────────────────────────────────────────────────────────┐
   │  title · sub · version  /  run# · pass · elapsed · clock · cap bar           │
-  ├ flow row 1 (11 rows) ─────────────────────────────────────────────────────────┤
-  │  S1 Discovery  │  ████████████████░░░░░░░░░ URL Queue 18/50  │  S2-4 Scraping │
+  ├ flow row 1 (9 rows) ──────────────────────────────────────────────────────────┤
+  │  S1 Discovery  │  ████████░░░░ URL Queue 18/50  │  S2-4 Scraping              │
   ├ flow row 2 (9 rows) ──────────────────────────────────────────────────────────┤
-  │  ████░░░░░░░░░░ Lead Queue 4/20  │  S5 Normalise  │  S6 Copywrite  │  S7 Dispatch │
+  │  S2-4 Scraping │  ████░░░░░░░ Lead Queue 4/20  │  S5 Normalise               │
+  ├ flow row 3 (9 rows) ──────────────────────────────────────────────────────────┤
+  │  S5 Normalise  │           →  sequential       │  S6 Copywrite               │
+  ├ flow row 4 (9 rows) ──────────────────────────────────────────────────────────┤
+  │  S6 Copywrite  │           →  sequential       │  S7 Dispatch                │
   ├ live events (remaining rows, min 4) ──────────────────────────────────────────┤
   │  HH:MM:SS  STAGE  text…                                           badge       │
   └ prompt zone (only when a question is pending) ────────────────────────────────┘
@@ -138,8 +142,8 @@ def _bar_markup(filled: int, total: int, width: int) -> str:
 
 # ── Panel renderers ────────────────────────────────────────────────────────────
 
-def _buf_panel_h(label: str, filled: int, cap: int, per_row: int) -> Panel:
-    """Horizontal buffer panel: one █/░ per queue slot, arranged in rows of per_row."""
+def _buf_panel(label: str, filled: int, cap: int, per_row: int) -> Panel:
+    """Queue buffer panel: one █/░ per slot, wrapped at per_row, centered."""
     pct   = filled / cap if cap else 0.0
     color = "green" if pct < 0.5 else ("yellow" if pct < 0.8 else "red")
 
@@ -155,6 +159,15 @@ def _buf_panel_h(label: str, filled: int, cap: int, per_row: int) -> Panel:
 
     return Panel(body, title=f"[dim]{label}[/dim]",
                  border_style="dim", padding=(0, 1))
+
+
+def _arrow_panel(label: str) -> Panel:
+    """Simple sequential-gate connector panel (no queue)."""
+    body = Text(justify="center")
+    body.append("\n\n")
+    body.append("→  ", style="dim")
+    body.append(label, style="dim italic")
+    return Panel(body, border_style="dim", padding=(0, 1))
 
 
 def _stage_card(st: StageState) -> Panel:
@@ -302,39 +315,33 @@ def build_layout(state: PipelineState) -> Layout:
 
     url_sz  = state.url_queue.qsize()  if state.url_queue  else 0
     lead_sz = state.lead_queue.qsize() if state.lead_queue else 0
-    ucap    = state.url_queue_cap
-    lcap    = state.lead_queue_cap
 
-    # Row 1 — S1 Discovery → URL Queue → S2-4 Scraping
-    row1 = Layout(name="row1")
-    row1.split_row(
-        Layout(_stage_card(state.s1),                          name="s1",      ratio=2),
-        Layout(_buf_panel_h("URL Queue", url_sz, ucap, 25),   name="url_buf", ratio=3),
-        Layout(_stage_card(state.s24),                         name="s24",     ratio=2),
-    )
-
-    # Row 2 — Lead Queue → S5 Normalise → S6 Copywrite → S7 Dispatch
-    row2 = Layout(name="row2")
-    row2.split_row(
-        Layout(_buf_panel_h("Lead Queue", lead_sz, lcap, 20), name="lead_buf", ratio=3),
-        Layout(_stage_card(state.s5),                          name="s5",       ratio=2),
-        Layout(_stage_card(state.s6),                          name="s6",       ratio=1),
-        Layout(_stage_card(state.s7),                          name="s7",       ratio=1),
-    )
-
-    layout   = Layout()
-    sections = [
-        Layout(header,               name="header", size=4),
-        Layout(row1,                 name="row1",   size=11),
-        Layout(row2,                 name="row2",   size=9),
-        Layout(_events_panel(state), name="events", minimum_size=4),
+    # Each entry: (left StageState, middle panel, right StageState)
+    flow_rows = [
+        (state.s1,  _buf_panel("URL Queue",  url_sz,  state.url_queue_cap,  25), state.s24),
+        (state.s24, _buf_panel("Lead Queue", lead_sz, state.lead_queue_cap, 20), state.s5),
+        (state.s5,  _arrow_panel("sequential"),                                   state.s6),
+        (state.s6,  _arrow_panel("sequential"),                                   state.s7),
     ]
+
+    sections = [Layout(header, name="header", size=4)]
+    for i, (left, mid, right) in enumerate(flow_rows):
+        row = Layout(name=f"flow{i}")
+        row.split_row(
+            Layout(_stage_card(left),  name=f"f{i}_l", ratio=2),
+            Layout(mid,                name=f"f{i}_m", ratio=3),
+            Layout(_stage_card(right), name=f"f{i}_r", ratio=2),
+        )
+        sections.append(Layout(row, name=f"flow{i}", size=9))
+
+    sections.append(Layout(_events_panel(state), name="events", minimum_size=4))
 
     if state.prompt_lines:
         height = min(len(state.prompt_lines) + 4, 10)
         sections.append(Layout(_prompt_panel(state.prompt_lines),
                                 name="prompt", size=height))
 
+    layout = Layout()
     layout.split_column(*sections)
     return layout
 
