@@ -1,20 +1,39 @@
 """
-Rich terminal live dashboard.
-Renders a two-panel layout: stats table on top, recent log feed below.
-Refreshes every 5 seconds when called in live mode.
+S.C.O.M.P — Terminal dashboard (v2).
+
+Screen layout (full-terminal, refreshes every 250 ms)
+──────────────────────────────────────────────────────
+  ┌ header (4 rows) ──────────────────────────────────────────────────────────────┐
+  │  title · sub · version  /  run# · pass · elapsed · clock · cap bar           │
+  ├ queue buffers (4 rows) ───────────────────────────────────────────────────────┤
+  │  URL Queue  [████████░░░░░░░░░░░░░░░░░░░░░░]  18/50                          │
+  │  Lead Queue [████░░░░░░░░░░░░░░░░░░░░░░░░░░]   4/20                          │
+  ├ stage cards (5 equal columns, 11 rows) ────────────────────────────────────────┤
+  │  S1 Discovery │ S2-4 Scraping │ S5 Normalise │ S6 Copywrite │ S7 Dispatch    │
+  ├ live events (remaining rows, min 4) ──────────────────────────────────────────┤
+  │  HH:MM:SS  STAGE  text…                                           badge       │
+  └ prompt zone (only when a question is pending) ────────────────────────────────┘
+
+State model
+───────────
+  StageState    mutable per-stage (status, note, current, items, stats)
+  PipelineState shared across all coroutines; also holds queue references and
+                a chronological event_log
+  PipelineUI    async context manager: owns the Live display + interactive prompts
+  build_layout  pure function → Rich Layout from PipelineState
 """
 
+import asyncio
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
-from rich import box
-from rich.columns import Columns
+from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -23,138 +42,399 @@ from db import database
 
 console = Console()
 
-VERSION = "v1.0"
-TITLE   = f"S.C.O.M.P  —  Stealth Collection, Outreach & Messaging Pipeline  {VERSION}"
+VERSION   = "v2.0"
+APP_TITLE = "S.C.O.M.P"
+APP_SUB   = "Stealth Collection, Outreach & Messaging Pipeline"
+
+# ── Stage status tokens ────────────────────────────────────────────────────────
+
+WAITING = "waiting"
+RUNNING = "running"
+DONE    = "done"
+ERROR   = "error"
+
+_ICON = {
+    WAITING: ("○", "dim white"),
+    RUNNING: ("●", "bold green"),
+    DONE:    ("✓", "bold cyan"),
+    ERROR:   ("✗", "bold red"),
+}
+_BORDER = {
+    WAITING: "dim",
+    RUNNING: "cyan",
+    DONE:    "green",
+    ERROR:   "red",
+}
+_STAGE_COLOR = {
+    "S1":   "blue",
+    "S2-4": "magenta",
+    "S5":   "cyan",
+    "S6":   "yellow",
+    "S7":   "green",
+}
 
 
-def _counts() -> dict:
-    return database.count_leads_by_status()
+# ── State objects ──────────────────────────────────────────────────────────────
+
+@dataclass
+class StageState:
+    number:  str
+    label:   str
+    status:  str  = WAITING
+    note:    str  = ""
+    current: str  = ""
+    items:   list = field(default_factory=list)   # [(text, badge), ...]
+    stats:   dict = field(default_factory=dict)
+
+    def add_item(self, text: str, right: str = "", *, maxkeep: int = 5):
+        self.items.append((text, right))
+        if len(self.items) > maxkeep:
+            self.items = self.items[-maxkeep:]
 
 
-def _sent_today() -> int:
-    return database.count_sent_today()
+@dataclass
+class PipelineState:
+    pass_num:   int   = 1
+    run_id:     int   = 0
+    started_at: float = field(default_factory=time.time)
+
+    s1:  StageState = field(default_factory=lambda: StageState("1",   "Discovery"))
+    s24: StageState = field(default_factory=lambda: StageState("2–4", "Scraping"))
+    s5:  StageState = field(default_factory=lambda: StageState("5",   "Normalise"))
+    s6:  StageState = field(default_factory=lambda: StageState("6",   "Copywrite"))
+    s7:  StageState = field(default_factory=lambda: StageState("7",   "Dispatch"))
+
+    # Live queue references — set by cmd_run() after queue creation.
+    # .qsize() is called on every render to show actual buffer depth.
+    url_queue:      object = None   # asyncio.Queue
+    lead_queue:     object = None   # asyncio.Queue
+    url_queue_cap:  int    = 50
+    lead_queue_cap: int    = 20
+
+    # Chronological event stream — (time_str, stage_id, text, badge)
+    event_log:    list = field(default_factory=list)
+
+    # Prompt zone — non-empty while awaiting user input
+    prompt_lines: list = field(default_factory=list)
+
+    def log_event(self, stage_id: str, text: str, badge: str = "") -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.event_log.append((ts, stage_id, text, badge))
+        if len(self.event_log) > 80:
+            self.event_log = self.event_log[-80:]
 
 
-def _recent_logs(n: int = 12) -> list:
-    return database.get_recent_email_logs(n)
+# ── Bar helper ─────────────────────────────────────────────────────────────────
 
-
-def _stats_table(counts: dict, sent_today: int) -> Table:
-    tbl = Table(box=box.SIMPLE_HEAVY, show_header=False, padding=(0, 2))
-    tbl.add_column("Metric", style="bold cyan", min_width=22)
-    tbl.add_column("Value",  style="white", justify="right", min_width=10)
-
-    def row(label, value, style="white"):
-        tbl.add_row(f"[{style}]{label}[/{style}]", f"[{style}]{value}[/{style}]")
-
-    row("Discovered",  counts.get("discovered", 0))
-    row("Normalised",  counts.get("normalized", 0))
-    row("Ready",       counts.get("ready", 0),    "green")
-    row("Drafted",     counts.get("drafted", 0),  "yellow")
-    row("Sent today",  f"{sent_today} / {settings.DAILY_EMAIL_CAP}", "bold green")
-    tbl.add_row()
-    row("Bounced",     counts.get("bounced", 0),  "red")
-    row("Replied",     counts.get("replied", 0),  "bright_green")
-    row("Flagged",     counts.get("flagged", 0),  "red")
-    row("Manual",      counts.get("manual", 0),   "yellow")
-    row("Skipped",     counts.get("skipped", 0))
-    row("Error",       counts.get("error", 0),    "red")
-    return tbl
-
-
-def _progress_bar(sent_today: int) -> Progress:
-    prog = Progress(
-        TextColumn("[bold cyan]  Daily cap"),
-        BarColumn(bar_width=40),
-        TextColumn(f"[green]{sent_today}[/green] / [white]{settings.DAILY_EMAIL_CAP}[/white]"),
+def _bar_markup(filled: int, total: int, width: int) -> str:
+    """Return Rich markup for a colored fill-bar."""
+    pct   = filled / total if total else 0.0
+    n     = int(pct * width)
+    color = "green" if pct < 0.5 else ("yellow" if pct < 0.8 else "red")
+    return (
+        f"[bold {color}]{'█' * n}[/bold {color}]"
+        f"[dim]{'░' * (width - n)}[/dim]"
     )
-    task = prog.add_task("", total=settings.DAILY_EMAIL_CAP)
-    prog.update(task, completed=sent_today)
-    return prog
 
 
-def _log_panel(logs: list) -> Panel:
-    lines = Text()
-    for log in logs:
-        ts = (log["sent_at"] or log.get("generated_at", ""))[:16].replace("T", " ")
-        status = (log["status"] or "").lower()
-        company = log.get("company") or ""
-        recipient = log.get("recipient_email") or ""
+# ── Panel renderers ────────────────────────────────────────────────────────────
 
-        if status == "sent":
-            color = "green"
-            icon  = "✓"
-        elif status == "flagged":
-            color = "red"
-            icon  = "✗"
-        else:
-            color = "yellow"
-            icon  = "·"
+def _queue_bar_panel(state: PipelineState) -> Panel:
+    url_sz  = state.url_queue.qsize()  if state.url_queue  else 0
+    lead_sz = state.lead_queue.qsize() if state.lead_queue else 0
+    ucap    = state.url_queue_cap
+    lcap    = state.lead_queue_cap
 
-        lines.append(f"  [{ts}]  ", style="dim")
-        lines.append(f"{icon} {status.upper():<8}", style=f"bold {color}")
-        lines.append(f" → {recipient}", style="white")
-        if company:
-            lines.append(f"  ({company})", style="dim")
-        lines.append("\n")
+    url_bar  = _bar_markup(url_sz,  ucap,  34)
+    lead_bar = _bar_markup(lead_sz, lcap,  22)
 
-    return Panel(lines, title="[bold]Recent Activity[/bold]", border_style="cyan", padding=(0, 1))
+    body = Text.from_markup(
+        f"  URL Queue   [{url_bar}]  {url_sz}/{ucap}\n"
+        f"  Lead Queue  [{lead_bar}]  {lead_sz}/{lcap}"
+    )
+    return Panel(body, title="[bold]Queue Buffers[/bold]",
+                 border_style="dim", padding=(0, 1))
 
+
+def _stage_card(st: StageState) -> Panel:
+    icon, istyle = _ICON.get(st.status, ("?", "white"))
+    border       = _BORDER.get(st.status, "dim")
+
+    tbl = Table.grid(padding=(0, 1))
+    tbl.add_column(width=2,  no_wrap=True)
+    tbl.add_column(ratio=1,  no_wrap=True, overflow="ellipsis")
+    tbl.add_column(width=7,  no_wrap=True, justify="right")
+
+    # Status
+    tbl.add_row(
+        f"[{istyle}]{icon}[/{istyle}]",
+        f"[{istyle}]{st.status.upper()}[/{istyle}]",
+        "",
+    )
+
+    # Note (engine name, warnings, etc.)
+    if st.note:
+        note = (st.note[:20] + "…") if len(st.note) > 21 else st.note
+        tbl.add_row("", f"[dim]{note}[/dim]", "")
+
+    # Current activity (only when running)
+    if st.current and st.status == RUNNING:
+        cur = (st.current[:20] + "…") if len(st.current) > 21 else st.current
+        tbl.add_row("[yellow]▶[/yellow]", f"[white]{cur}[/white]", "")
+
+    tbl.add_row("", "", "")  # spacer
+
+    # Recent items (last 3)
+    for text, badge in st.items[-3:]:
+        t = (text[:16] + "…") if len(text) > 17 else text
+        b = badge[:7]
+        tbl.add_row("[dim]·[/dim]", f"[dim]{t}[/dim]", f"[dim]{b}[/dim]")
+
+    tbl.add_row("", "", "")  # spacer
+
+    # Stats footer — abbreviated keys to fit narrow columns
+    if st.stats:
+        parts = []
+        _abbrev = {
+            "queries": "q", "urls": "u", "scraped": "sc",
+            "emails":  "em", "queued": "q", "stored": "st",
+            "dups": "dup", "drafted": "dr", "flagged": "fl",
+            "sent": "s", "cap": "/", "skipped": "sk",
+        }
+        for k, v in list(st.stats.items())[:4]:
+            short = _abbrev.get(k, k[:3])
+            parts.append(f"[dim]{short}[/dim][bold white]{v}[/bold white]")
+        tbl.add_row("", " ".join(parts), "")
+
+    title = (
+        f"[{istyle}]{icon}[/{istyle}] "
+        f"[bold]S{st.number}[/bold]"
+        f"[dim]·{st.label}[/dim]"
+    )
+    return Panel(tbl, title=title, border_style=border, padding=(0, 0))
+
+
+def _events_panel(state: PipelineState) -> Panel:
+    # Pull from event_log (pipeline events) and DB email log, merge newest-first
+    db_logs = database.get_recent_email_logs(10)
+
+    tbl = Table.grid(padding=(0, 1))
+    tbl.add_column(width=8,  no_wrap=True)   # time
+    tbl.add_column(width=5,  no_wrap=True)   # stage id
+    tbl.add_column(ratio=1,  no_wrap=True, overflow="ellipsis")   # text
+    tbl.add_column(width=12, justify="right", no_wrap=True)  # badge
+
+    # Pipeline events (last 12 from event_log)
+    for ts, stage_id, text, badge in state.event_log[-12:]:
+        color = _STAGE_COLOR.get(stage_id, "white")
+        txt   = (text[:36] + "…") if len(text) > 37 else text
+        tbl.add_row(
+            f"[dim]{ts}[/dim]",
+            f"[{color}]{stage_id:<5}[/{color}]",
+            f"[white]{txt}[/white]",
+            f"[dim]{badge}[/dim]",
+        )
+
+    # Separator between pipeline events and DB email log
+    if state.event_log and db_logs:
+        tbl.add_row("[dim]─[/dim]", "[dim]─────[/dim]",
+                    "[dim]─── email log ──────────────────────[/dim]", "")
+
+    # DB email log (sent / drafted / flagged)
+    for row in db_logs[:5]:
+        ts     = (row["sent_at"] or "")[:16].replace("T", " ")[11:]  # HH:MM only
+        status = (row["status"] or "").lower()
+        recip  = row["recipient_email"] or ""
+        co     = row["company"] or ""
+        icon, color = {
+            "sent":    ("✓", "green"),
+            "flagged": ("✗", "red"),
+            "drafted": ("·", "yellow"),
+        }.get(status, ("·", "dim"))
+        label = f"{icon} {status.upper()}"
+        tbl.add_row(
+            f"[dim]{ts}[/dim]",
+            f"[{color}]{label:<5}[/{color}]",
+            f"[dim]{recip[:36]}[/dim]",
+            f"[dim]{co[:12]}[/dim]",
+        )
+
+    if not state.event_log and not db_logs:
+        tbl.add_row("", "", "[dim]Pipeline starting…[/dim]", "")
+
+    return Panel(tbl, title="[bold]Live Events[/bold]",
+                 border_style="dim", padding=(0, 1))
+
+
+def _prompt_panel(lines: list) -> Panel:
+    body = Text()
+    for ln in lines:
+        body.append(ln + "\n")
+    return Panel(
+        body,
+        title="[bold yellow]⚡  Action Required[/bold yellow]",
+        border_style="yellow",
+        padding=(0, 2),
+    )
+
+
+# ── Layout builder ─────────────────────────────────────────────────────────────
+
+def build_layout(state: PipelineState) -> Layout:
+    sent    = database.count_sent_today()
+    cap     = settings.DAILY_EMAIL_CAP
+    now     = datetime.now().strftime("%H:%M:%S")
+    elapsed = _elapsed(state.started_at)
+    cap_bar = _bar_markup(sent, cap, 24)
+
+    header = Panel(
+        Align.center(
+            Text.from_markup(
+                f"[bold cyan]{APP_TITLE}[/bold cyan]  [dim]·  {APP_SUB}  ·  {VERSION}[/dim]\n"
+                f"[dim]Run #{state.run_id}  ·  Pass {state.pass_num}  ·  {elapsed}  ·  {now}[/dim]"
+                f"   [{cap_bar}]  [bold]{sent}[/bold][dim]/{cap}[/dim]"
+            )
+        ),
+        border_style="cyan",
+        padding=(0, 2),
+    )
+
+    cards_row = Layout(name="cards_row")
+    cards_row.split_row(
+        Layout(_stage_card(state.s1),  name="s1"),
+        Layout(_stage_card(state.s24), name="s24"),
+        Layout(_stage_card(state.s5),  name="s5"),
+        Layout(_stage_card(state.s6),  name="s6"),
+        Layout(_stage_card(state.s7),  name="s7"),
+    )
+
+    layout   = Layout()
+    sections = [
+        Layout(header,                  name="header",  size=4),
+        Layout(_queue_bar_panel(state), name="queues",  size=4),
+        Layout(cards_row,               name="cards",   size=11),
+        Layout(_events_panel(state),    name="events",  minimum_size=4),
+    ]
+
+    if state.prompt_lines:
+        height = min(len(state.prompt_lines) + 4, 10)
+        sections.append(Layout(_prompt_panel(state.prompt_lines),
+                                name="prompt", size=height))
+
+    layout.split_column(*sections)
+    return layout
+
+
+def _elapsed(started_at: float) -> str:
+    secs = int(time.time() - started_at)
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}h {m:02d}m" if h else f"{m:02d}m {s:02d}s"
+
+
+# ── PipelineUI context manager ─────────────────────────────────────────────────
+
+class PipelineUI:
+    """
+    Async context manager: owns the Live display for the pipeline run.
+
+    ui.refresh()              — immediate re-render (call after any state mutation)
+    await ui.ask(lines, lbl)  — pause live, read user input, resume; returns str
+    """
+
+    def __init__(self, state: PipelineState):
+        self.state = state
+        self._live = None
+        self._stop = asyncio.Event()
+        self._task = None
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        self._live = Live(
+            build_layout(self.state),
+            console=console,
+            screen=True,
+            refresh_per_second=1,
+        )
+        self._live.__enter__()
+        self._task = asyncio.create_task(self._refresh_loop())
+        return self
+
+    async def __aexit__(self, *_):
+        self._stop.set()
+        if self._task:
+            await self._task
+        if self._live:
+            self._live.__exit__(None, None, None)
+
+    async def _refresh_loop(self):
+        while not self._stop.is_set():
+            async with self._lock:
+                if self._live and not self._stop.is_set():
+                    self._live.update(build_layout(self.state))
+            await asyncio.sleep(0.25)
+
+    def refresh(self):
+        if self._live:
+            self._live.update(build_layout(self.state))
+
+    async def ask(self, prompt_lines: list[str], input_label: str = "  → ") -> str:
+        """Pause the live display, collect user input, then resume."""
+        self.state.prompt_lines = prompt_lines
+        self.refresh()
+
+        async with self._lock:
+            self._live.stop()
+            console.print()
+            console.print(_prompt_panel(prompt_lines))
+            response = await asyncio.to_thread(input, input_label)
+            console.print()
+            self._live.start(refresh=True)
+
+        self.state.prompt_lines = []
+        self.refresh()
+        return response.strip().lower()
+
+
+# ── Standalone modes (--dashboard, --summary) ──────────────────────────────────
 
 def render_snapshot() -> None:
-    """Print a single static snapshot — used by --summary."""
-    counts     = _counts()
-    sent_today = _sent_today()
-    logs       = _recent_logs()
+    """Static one-shot snapshot — used by --summary."""
+    state  = PipelineState()
+    counts = database.count_leads_by_status()
+    sent   = database.count_sent_today()
+
+    state.s1.stats  = {"urls":    counts.get("discovered", 0)}
+    state.s5.stats  = {"stored":  counts.get("normalized", 0),
+                       "ready":   counts.get("ready", 0)}
+    state.s6.stats  = {"drafted": counts.get("drafted", 0),
+                       "flagged": counts.get("flagged", 0)}
+    state.s7.stats  = {"sent":    sent,
+                       "cap":     settings.DAILY_EMAIL_CAP}
+    for st in (state.s1, state.s24, state.s5, state.s6, state.s7):
+        st.status = DONE
 
     console.print()
-    console.rule(f"[bold cyan]{TITLE}[/bold cyan]")
-    console.print()
-    console.print(_stats_table(counts, sent_today))
-    console.print(_progress_bar(sent_today))
-    console.print()
-    console.print(_log_panel(logs))
+    console.print(build_layout(state))
     console.print()
 
 
 def render_live(stop_event=None) -> None:
-    """
-    Live auto-refreshing dashboard. Runs until stop_event is set or Ctrl-C.
-    """
-    def _build():
-        counts     = _counts()
-        sent_today = _sent_today()
-        logs       = _recent_logs()
-
-        layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="body"),
-            Layout(name="footer", size=3),
-        )
-        layout["body"].split_row(
-            Layout(name="stats", ratio=1),
-            Layout(name="logs",  ratio=2),
-        )
-
-        layout["header"].update(
-            Panel(f"[bold cyan]{TITLE}[/bold cyan]", border_style="cyan")
-        )
-        layout["stats"].update(
-            Panel(_stats_table(counts, sent_today), title="[bold]Stats[/bold]", border_style="blue")
-        )
-        layout["logs"].update(_log_panel(logs))
-        layout["footer"].update(
-            Panel(_progress_bar(sent_today), border_style="green")
-        )
-        return layout
-
+    """Auto-refreshing live view — used by --dashboard (no pipeline running)."""
+    state = PipelineState()
     try:
-        with Live(_build(), refresh_per_second=0.2, screen=True) as live:
+        with Live(build_layout(state), console=console, screen=True,
+                  refresh_per_second=0.2) as live:
             while True:
                 if stop_event and stop_event.is_set():
                     break
+                counts = database.count_leads_by_status()
+                sent   = database.count_sent_today()
+                state.s1.stats  = {"urls":    counts.get("discovered", 0)}
+                state.s5.stats  = {"stored":  counts.get("normalized", 0)}
+                state.s6.stats  = {"drafted": counts.get("drafted", 0)}
+                state.s7.stats  = {"sent":    sent}
+                live.update(build_layout(state))
                 time.sleep(5)
-                live.update(_build())
     except KeyboardInterrupt:
         pass
