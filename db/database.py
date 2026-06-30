@@ -146,8 +146,8 @@ def start_run() -> int:
         return cur.lastrowid
 
 
-def finish_run(run_id: int, leads_attempted: int, emails_sent: int,
-               emails_skipped: int, emails_flagged: int) -> None:
+def finish_run(run_id: int, leads_attempted: int = 0, emails_sent: int = 0,
+               emails_skipped: int = 0, emails_flagged: int = 0) -> None:
     with get_conn() as conn:
         conn.execute(
             """UPDATE runs
@@ -290,3 +290,12 @@ def remove_pending_auth_site(domain: str) -> None:
     """Called when the user successfully logs in or permanently declines."""
     with get_conn() as conn:
         conn.execute("DELETE FROM pending_auth_sites WHERE domain=?", (domain,))
+
+
+def get_pending_auth_site_attempts(domain: str) -> int:
+    """Returns current skip-attempt count for a domain, or 0 if not pending."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM pending_auth_sites WHERE domain=?", (domain,)
+        ).fetchone()
+    return row["attempts"] if row else 0
