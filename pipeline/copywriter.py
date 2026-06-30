@@ -4,11 +4,14 @@ Fully offline — no external API calls.
 
 Assembly per lead
 ─────────────────
-  1. opening    niche-specific, rotated by lead_id
-  2. value_prop with_desc variant when company_desc > 50 chars, else general
-  3. cta        rotated by lead_id (offset so it differs from opening rotation)
+  1. salutation rotated by lead_id + 5
+  2. intro      who Subodh is; outside validated core
+  3. opening    niche-specific, rotated by lead_id
+  4. value_prop with_desc variant when company_desc > 50 chars, else general
+  5. cta        rotated by lead_id (offset so it differs from opening rotation)
+  6. signature  constant
 
-  body    = opening  +  "\\n\\n"  +  value_prop  +  "\\n\\n"  +  cta
+  body    = salutation + intro + opening + value_prop + cta + signature
   subject = subjects[niche][lead_id % pool_size]
 
 Validation
@@ -43,12 +46,27 @@ def _pick(pool: list, idx: int) -> str:
     return pool[idx % len(pool)]
 
 
+def _sentence_cap(text: str, max_chars: int = 220) -> str:
+    """Truncate text at the last sentence boundary at or before max_chars."""
+    if len(text) <= max_chars:
+        return text
+    chunk = text[:max_chars]
+    # Walk backwards from the limit looking for sentence-ending punctuation
+    for i in range(len(chunk) - 1, max_chars // 2, -1):
+        if chunk[i] in ".!?" and (i + 1 >= len(chunk) or chunk[i + 1] in " \t"):
+            return chunk[:i + 1]
+    # No clean boundary — cut at last word boundary, no ellipsis in formal email
+    idx = chunk.rfind(" ")
+    return chunk[:idx].rstrip() if idx > 0 else chunk[:max_chars]
+
+
 def _render(template: str, lead: dict) -> str:
     """Fill placeholders; silently ignore unknown keys or malformed company data."""
     company    = lead.get("company")      or "your company"
     niche      = lead.get("niche")        or "technology"
     desc       = lead.get("company_desc") or ""
-    desc_short = (desc[:80].rstrip() + "...") if len(desc) > 80 else desc
+    # Cut description at a clean sentence boundary — no mid-sentence ellipsis
+    desc_short = _sentence_cap(desc, 220)
 
     # Sanitise values that could break str.format() if they contain literal braces
     def _safe(s: str) -> str:
@@ -57,9 +75,8 @@ def _render(template: str, lead: dict) -> str:
     safe_company    = _safe(company)
     safe_niche      = _safe(niche)
     safe_desc       = _safe(desc)
-
-    # desc_short has already been built from desc, so sanitise the same way
     safe_desc_short = _safe(desc_short)
+    portfolio_url   = settings.PORTFOLIO_URL or ""
 
     # Normalise YAML folded/literal block scalars: collapse internal newlines
     # that the YAML parser left as-is (folded lines become spaces, not \n)
@@ -71,15 +88,16 @@ def _render(template: str, lead: dict) -> str:
             niche=safe_niche,
             company_desc=safe_desc,
             company_desc_short=safe_desc_short,
+            portfolio_url=portfolio_url,
         )
     except (KeyError, IndexError, ValueError):
-        # Last-resort: replace manually without format()
         return (
             template
             .replace("{company}", safe_company)
             .replace("{niche}", safe_niche)
             .replace("{company_desc_short}", safe_desc_short)
             .replace("{company_desc}", safe_desc)
+            .replace("{portfolio_url}", portfolio_url)
         )
 
 
@@ -96,12 +114,22 @@ def _validate(text: str) -> bool:
 
 def _assemble_body(lead: dict, t: dict) -> tuple[str, bool]:
     """
-    Returns (body, is_valid).
+    Returns (full_body, is_valid).
+    Validation runs on the core body only (opening + value_prop + cta) so that
+    the fixed salutation and signature do not inflate the word count.
     Tries short value_prop on first validation failure before giving up.
     """
     niche = lead.get("niche") or "technology"
     idx   = lead.get("id", 0)
     desc  = lead.get("company_desc") or ""
+
+    # Salutation — rotated independently, rendered with {company} placeholder
+    salutations = t.get("salutations", ["Dear Hiring Manager,"])
+    salutation  = _render(_pick(salutations, idx + 5), lead)
+
+    # Intro — who Subodh is; outside validated core so it doesn't inflate word count
+    intros = t.get("intro", ["I am Subodh Adhikari, a full-stack developer based in Kalimpong."])
+    intro  = _render(_pick(intros, idx + 3), lead)
 
     # Opening: prefer niche pool, fall back to "technology"
     openings = t["openings"].get(niche) or t["openings"]["technology"]
@@ -116,16 +144,21 @@ def _assemble_body(lead: dict, t: dict) -> tuple[str, bool]:
     value_prop = _render(_pick(vp_pool, idx + 1), lead)
 
     # CTA (offset +2 so the rotation is independent of the opening)
-    cta  = _render(_pick(t["ctas"], idx + 2), lead)
-    body = f"{opening}\n\n{value_prop}\n\n{cta}"
+    cta = _render(_pick(t["ctas"], idx + 2), lead)
 
-    if _validate(body):
-        return body, True
+    # Signature — loaded as-is; NOT passed through _render so its newlines survive
+    signature = t.get("signature", "Best regards,\n\nSubodh Adhikari").rstrip()
+
+    # Core body is what gets validated (word count + forbidden phrases)
+    core = f"{opening}\n\n{value_prop}\n\n{cta}"
+
+    if _validate(core):
+        return f"{salutation}\n\n{intro}\n\n{core}\n\n{signature}", True
 
     # First failure: swap in the shorter value prop variant
     short_vp = _render(_pick(t["value_props"]["short"], idx), lead)
-    body = f"{opening}\n\n{short_vp}\n\n{cta}"
-    return body, _validate(body)
+    core = f"{opening}\n\n{short_vp}\n\n{cta}"
+    return f"{salutation}\n\n{intro}\n\n{core}\n\n{signature}", _validate(core)
 
 
 def _assemble_subject(lead: dict, t: dict) -> str:
