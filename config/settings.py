@@ -26,13 +26,19 @@ TARGETS_YAML  = str(BASE_DIR / "config" / "targets.yaml")
 # Seconds to wait for user response before skipping an auth-required site
 AUTH_PROMPT_TIMEOUT: int = int(os.getenv("AUTH_PROMPT_TIMEOUT", "60"))
 
+# ── Pipeline passes ───────────────────────────────────────────────────────────
+# S1 loops passes indefinitely until DAILY_EMAIL_CAP is reached.
+# DISCOVERY_PASS_DELAY: seconds to wait between passes (lets Brave/Bing rate-limit
+# cool down and gives downstream stages time to drain the URL queue).
+DISCOVERY_PASS_DELAY: int = int(os.getenv("DISCOVERY_PASS_DELAY", "300"))
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 DISPATCH_GAP_MIN: int = 4   # minutes
 DISPATCH_GAP_MAX: int = 12  # minutes
 
 # ── Search engine ─────────────────────────────────────────────────────────────
-# Supported values: "bing", "duckduckgo"
-SEARCH_ENGINE: str = os.getenv("SEARCH_ENGINE", "bing").lower()
+# Supported values: "brave" | "google" | "bing" (all Playwright stealth) | "duckduckgo" (httpx fallback)
+SEARCH_ENGINE: str = os.getenv("SEARCH_ENGINE", "brave").lower()
 
 # ── Browser engine ────────────────────────────────────────────────────────────
 # Supported values: "firefox", "chromium", "webkit"
