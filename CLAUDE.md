@@ -4,7 +4,7 @@
 
 S.C.O.M.P (Stealth Collection, Outreach & Messaging Pipeline) is a single-operator,
 zero-budget Python CLI that automates cold email outreach for freelance/job opportunities.
-Fully offline — no third-party LLM or paid API. Uses only: Bing/Brave/DDG search,
+Fully offline — no third-party LLM or paid API. Uses only: Brave/Bing/Google/DDG search,
 YAML-based query bank + template engine, Outlook Web via Playwright.
 
 ---
@@ -37,7 +37,7 @@ YAML-based query bank + template engine, Outlook Web via Playwright.
   direct `UPDATE leads SET status=?` call.
 
 - **Auth bootstrap timeout.** If a site requires login and the user doesn't respond within
-  `AUTH_PROMPT_TIMEOUT` seconds (default 120), the domain is added to `skipped_sites` and
+  `AUTH_PROMPT_TIMEOUT` seconds (default 60), the domain is added to `skipped_sites` and
   the pipeline continues. Same site will prompt again on the next run unless the user
   explicitly skipped with "n". Auto-permanent-skip after 5 timeouts (`PERM_SKIP_AFTER`).
 
