@@ -91,37 +91,180 @@ async def ensure_session() -> None:
     console.print("  [green]Session saved — continuing...[/green]\n")
 
 
-async def _compose_and_send(page: Page, to: str, subject: str, body: str) -> bool:
+async def _wait_new_mail_button(page: Page, timeout_ms: int = 20000) -> bool:
+    """Waits for the inbox New mail button to be clickable."""
     try:
-        # Open compose window
-        await page.click('[aria-label="New mail"]', timeout=10000)
+        btn = page.locator('[aria-label="New mail"]').first
+        await btn.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
 
-        # To field — focus is here on compose open
-        to_input = page.locator('input[aria-label="To"]').first
-        await to_input.wait_for(state="visible", timeout=8000)
+
+async def _compose_and_send(
+    page: Page, context: BrowserContext, to: str, subject: str, body: str
+) -> bool:
+    """
+    Composes and sends one email via Outlook Web.
+    Handles both same-page compose pane and new-tab compose window,
+    since Outlook opens compose in a new tab when in headless mode.
+    """
+    compose_page = page  # fallback; reassigned if a new tab opens
+    try:
+        # Ensure inbox is in a clean state
+        if not await _wait_new_mail_button(page, timeout_ms=20000):
+            logger.warning("New mail button not found — navigating back to inbox")
+            await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
+            if not await _wait_new_mail_button(page, timeout_ms=20000):
+                raise RuntimeError("New mail button still missing after reload")
+
+        # Track existing tabs so we can detect a new one opening
+        pages_before = {id(p) for p in context.pages}
+        await page.click('[aria-label="New mail"]', timeout=15000)
+
+        # Wait up to 5s for Outlook to open compose (same page or new tab)
+        for _ in range(25):
+            await asyncio.sleep(0.2)
+            new_tabs = [p for p in context.pages if id(p) not in pages_before]
+            if new_tabs:
+                compose_page = new_tabs[-1]
+                logger.debug("Compose opened in new tab: %s", compose_page.url)
+                break
+
+        # Wait for compose page to finish loading
+        try:
+            await compose_page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
+        # Give Outlook's React app time to mount the To field
+        await asyncio.sleep(2.0)
+
+        # To field — full-window compose uses contenteditable divs, not <input> elements
+        to_input = None
+        to_selectors = [
+            # Full-window compose (new tab) — contenteditable / role=textbox
+            'div[aria-label="To"]',
+            'div[aria-label="To"] [role="textbox"]',
+            'div[role="textbox"][aria-label*="To"]',
+            # Some Outlook versions use a well/token input inside a labelled container
+            '[data-testid="RecipientTo"] [role="textbox"]',
+            '[data-testid="RecipientTo"] input',
+            # Inline compose pane (same page) — classic input elements
+            'input[aria-label="To"]',
+            'input[aria-label="Add recipients"]',
+            'div[aria-label="To"] input',
+            # Broader fallbacks
+            '[aria-label*="recipient" i]',
+            'input[type="text"][aria-autocomplete]',
+        ]
+        for sel in to_selectors:
+            loc = compose_page.locator(sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=4000)
+                to_input = loc
+                logger.debug("To field matched selector: %s", sel)
+                break
+            except Exception:
+                continue
+
+        if to_input is None:
+            # Dump page HTML for diagnosis (truncated)
+            try:
+                html_snippet = await compose_page.evaluate(
+                    "document.documentElement.outerHTML.slice(0, 3000)"
+                )
+                logger.error("To field not found. Page HTML (first 3000 chars):\n%s", html_snippet)
+            except Exception as dump_exc:
+                logger.error("To field not found and HTML dump failed: %s", dump_exc)
+            raise RuntimeError("Could not locate To field in compose pane")
+
+        await to_input.click()
         await to_input.fill(to)
         await to_input.press("Tab")
+        await asyncio.sleep(0.5)  # let autocomplete dismiss
 
-        # Subject
-        subj = page.locator('[aria-label="Add a subject"]').first
-        await subj.wait_for(state="visible", timeout=8000)
+        # Subject — selector differs between inline pane and full-window compose
+        subj = None
+        for subj_sel in (
+            '[aria-label="Add a subject"]',
+            'input[aria-label="Subject"]',
+            '[aria-label="Subject"]',
+            '[placeholder*="subject" i]',
+            '[aria-placeholder*="subject" i]',
+            'input[type="text"][aria-label*="subject" i]',
+        ):
+            loc = compose_page.locator(subj_sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=4000)
+                subj = loc
+                logger.debug("Subject field matched selector: %s", subj_sel)
+                break
+            except Exception:
+                continue
+
+        if subj is None:
+            try:
+                html_snippet = await compose_page.evaluate(
+                    "document.documentElement.outerHTML.slice(0, 3000)"
+                )
+                logger.error("Subject field not found. Page HTML:\n%s", html_snippet)
+            except Exception:
+                pass
+            raise RuntimeError("Could not locate Subject field in compose pane")
+
+        await subj.click()
         await subj.fill(subject)
 
         # Body (contenteditable div)
-        body_el = page.locator('div[aria-label="Message body, press Alt+F10 to exit"]').first
-        await body_el.wait_for(state="visible", timeout=8000)
+        body_sel = None
+        for b_sel in (
+            'div[aria-label="Message body, press Alt+F10 to exit"]',
+            'div[role="textbox"][aria-label*="body" i]',
+            '[aria-label*="Message body" i]',
+            'div[contenteditable="true"][aria-multiline="true"]',
+        ):
+            loc = compose_page.locator(b_sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=4000)
+                body_sel = loc
+                logger.debug("Body field matched selector: %s", b_sel)
+                break
+            except Exception:
+                continue
+
+        if body_sel is None:
+            raise RuntimeError("Could not locate message body field in compose pane")
+
+        body_el = body_sel
         await body_el.click()
         await body_el.fill(body)
 
-        # Send via keyboard shortcut — more reliable than clicking the button
-        await page.keyboard.press("Control+Return")
-        await page.wait_for_timeout(2000)
+        # Send via keyboard shortcut
+        await compose_page.keyboard.press("Control+Enter")
+
+        # Wait for compose to close — tab closes if it was a popup, pane hides otherwise
+        try:
+            if compose_page is not page:
+                await compose_page.wait_for_event("close", timeout=8000)
+            else:
+                await compose_page.locator(
+                    'div[aria-label="Message body, press Alt+F10 to exit"]'
+                ).first.wait_for(state="hidden", timeout=8000)
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(1500)
         return True
 
     except Exception as exc:
         logger.error("Compose/send failed for %s: %s", to, exc)
         try:
-            await page.keyboard.press("Escape")
+            if compose_page is not page:
+                await compose_page.close()
+            else:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
         except Exception:
             pass
         return False
@@ -175,7 +318,7 @@ async def run_dispatch(progress_callback=None) -> dict:
         page: Page = await context.new_page()
 
         await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
-        if not await _wait_inbox_any_page(context):
+        if not await _wait_inbox_any_page(context, timeout_ms=30000):
             logger.error("Outlook session expired — run: python main.py --setup-sender")
             stats["halted"] = True
             await browser.close()
@@ -191,6 +334,7 @@ async def run_dispatch(progress_callback=None) -> dict:
             row = dict(email_row)
             success = await _compose_and_send(
                 page,
+                context,
                 row["recipient_email"],
                 row["subject"],
                 row["body"],
@@ -200,7 +344,12 @@ async def run_dispatch(progress_callback=None) -> dict:
                 database.mark_email_sent(row["id"], row["lead_id"])
                 stats["sent"] += 1
                 if progress_callback:
-                    progress_callback(already_sent_today + stats["sent"], settings.DAILY_EMAIL_CAP)
+                    progress_callback(
+                        already_sent_today + stats["sent"],
+                        settings.DAILY_EMAIL_CAP,
+                        row["recipient_email"],
+                        row.get("company", ""),
+                    )
                 logger.info("Sent → %s (%s)", row["recipient_email"], row.get("company", ""))
 
                 if stats["sent"] < remaining_cap and i < len(drafted) - 1:
@@ -210,6 +359,8 @@ async def run_dispatch(progress_callback=None) -> dict:
                     )
                     logger.debug("Waiting %ds before next send...", gap)
                     await asyncio.sleep(gap)
+                    # Navigate back to inbox after the gap — keeps page state clean
+                    await page.goto(_INBOX_URL, wait_until="domcontentloaded", timeout=30000)
             else:
                 database.update_lead_status(row["lead_id"], "flagged", "web send failed")
                 stats["skipped"] += 1
