@@ -1,0 +1,106 @@
+# S.C.O.M.P — Discovery Config and Per-Site Selectors
+#
+# Two sections:
+#   discovery    — pipeline-wide settings and URL classifier signals
+#   known_sites  — CSS selectors for specific job boards / company sites
+#
+# CSS selectors in known_sites tell the scraper exactly where to find
+# company names, descriptions, and contact emails on well-known sites.
+# When a site redesigns its HTML, update only the selector here — no code change.
+#
+# To customise:
+#   - Adjust max_urls_per_run and max_pages_per_query to control run volume.
+#   - Add domains to discard_signals to skip sources that waste your quota.
+#   - Add entries to known_sites for any site you target frequently.
+#   - Restart the container — no rebuild needed.
+
+
+discovery:
+  enabled: true
+  max_urls_per_run: 450
+  max_pages_per_query: 5
+  # Fallback value — SEARCH_ENGINE env var takes precedence when set.
+  search_engine: "brave"
+
+  url_classifier:
+
+    # URL path segments that suggest a job listing or hiring page
+    job_board_signals:
+      - "/jobs"
+      - "/careers"
+      - "/hiring"
+      - "/freelance"
+      - "/work-with-us"
+      - "/opportunities"
+      - "/vacancies"
+
+    # URL path segments that suggest a company contact or about page
+    company_signals:
+      - "/contact"
+      - "/about"
+      - "/team"
+      - "/hire"
+      - "/services"
+      - "/solutions"
+      - "/company"
+      - "/our-work"
+      - "/portfolio"
+
+    # Domains to discard immediately — social media, content platforms,
+    # large job boards, and aggregators that never contain direct leads.
+    discard_signals:
+      # Social / content platforms
+      - "reddit.com"
+      - "youtube.com"
+      - "twitter.com"
+      - "x.com"
+      - "facebook.com"
+      - "instagram.com"
+      - "quora.com"
+      - "wikipedia.org"
+      - "medium.com"
+      - "dev.to"
+      # Developer / code hosting
+      - "github.com"
+      - "stackoverflow.com"
+      - "gitlab.com"
+      # Large job boards (not direct company sites)
+      - "linkedin.com/in/"
+      - "glassdoor.com"
+      - "indeed.com"
+      - "monster.com"
+      - "wellfound.com/jobs"
+      - "remoteok.com"
+      - "weworkremotely.com"
+      # News and press
+      - "techcrunch.com"
+      - "forbes.com"
+      - "businessinsider.com"
+      - "crunchbase.com"
+
+
+# ── Known site configs ────────────────────────────────────────────────────────
+# Add entries here for sites you visit frequently so the scraper can extract
+# company name, description, and emails using precise CSS selectors rather
+# than falling back to generic meta-tag parsing.
+#
+# Structure per entry:
+#   base_url:   canonical URL (used for domain matching)
+#   selectors:
+#     company_name:  CSS selector for the company / posting title
+#     company_desc:  CSS selector for a description snippet
+#     email:         CSS selector for a contact email element (optional)
+
+known_sites:
+
+  example_job_board:
+    base_url: "https://www.example-jobs.com"
+    selectors:
+      company_name: "h1.company-name"
+      company_desc: "div.company-description p"
+
+  example_company_directory:
+    base_url: "https://www.example-directory.com"
+    selectors:
+      company_name: "h1.listing-title"
+      company_desc: "div.listing-summary"

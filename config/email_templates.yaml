@@ -1,0 +1,131 @@
+# S.C.O.M.P — Email Templates
+#
+# Assembly per lead:
+#   body = salutation + intro + opening + value_prop + cta + signature
+#
+# Validation runs on the CORE body only (opening + value_prop + cta).
+# salutation, intro, and signature are excluded from the word count.
+# If the core exceeds EMAIL_BODY_MAX_WORDS, the short value_prop is tried.
+# If still invalid, the lead is flagged.
+#
+# Available placeholders (filled at runtime):
+#   {company}             — company name
+#   {niche}               — detected niche
+#   {company_desc_short}  — meta description truncated at a sentence boundary
+#   {portfolio_url}       — value of PORTFOLIO_URL env var (empty string if unset)
+#
+# To customise:
+#   Edit any section below to match your skills, location, and tone.
+#   Add more items to any list — they are rotated per lead via lead_id % pool_size.
+#   Restart the container — no rebuild needed.
+
+
+# ── Salutations ───────────────────────────────────────────────────────────────
+
+salutations:
+  - "Dear Hiring Manager,"
+  - "Dear {company} Team,"
+  - "To the Hiring Team at {company},"
+  - "Dear Hiring Team,"
+
+
+# ── Introductions ─────────────────────────────────────────────────────────────
+# States who you are. Outside the validated word count.
+
+intro:
+  - "My name is [Your Name]. I am a [your role] based in [your location],
+    and I build [what you build] independently."
+  - "I am [Your Name], a [your role] based in [your location].
+    I take on projects from start to finish as a single developer."
+
+
+# ── Openings (per niche) ─────────────────────────────────────────────────────
+# Niche-specific first sentence of the core body.
+# Add a key per niche that matches what scraper/discovery.py can detect.
+# Falls back to "technology" if no niche match is found.
+
+openings:
+  technology:
+    - "I came across {company} and wanted to reach out about a potential collaboration."
+    - "{company} looks like the kind of team that values clean, maintainable software."
+
+  saas:
+    - "I noticed {company} is building a SaaS product and thought I could help."
+    - "I came across {company} and was impressed by the product you are building."
+
+  fintech:
+    - "I came across {company} and wanted to reach out about your engineering needs."
+    - "{company} is working in a space where reliable backend systems matter."
+
+  ecommerce:
+    - "I found {company} and wanted to reach out about a possible collaboration."
+    - "{company} looks like a team that could benefit from stronger web infrastructure."
+
+  devtools:
+    - "I came across {company} and your tooling caught my attention."
+    - "Developer tools need to be rock-solid — I think I can help {company}."
+
+
+# ── Value Propositions ────────────────────────────────────────────────────────
+
+value_props:
+
+  # Used when the lead has a company description longer than 50 characters
+  with_desc:
+    - "Having read about {company_desc_short}, I believe my background in
+      [your stack] would be a strong fit for your team."
+    - "Your work on {company_desc_short} aligns well with projects I have
+      delivered independently."
+
+  # Used when no useful company description is available
+  general:
+    - "I specialise in [your stack] and have delivered [type of project]
+      for clients independently."
+    - "My background covers [skill 1], [skill 2], and [skill 3],
+      which I have applied on production projects."
+
+  # Fallback when the primary value_prop pushes the body over the word limit
+  short:
+    - "I work across [stack summary] and can contribute from day one."
+    - "My experience with [key skill] would be directly applicable here."
+
+
+# ── Calls to Action ───────────────────────────────────────────────────────────
+
+ctas:
+  - "If you have any upcoming projects or open positions, I would welcome
+    the opportunity to discuss how I can contribute."
+  - "I would be happy to share more about my work or set up a brief call
+    at your convenience."
+  - "Please let me know if there is a fit — I am available to discuss
+    further at a time that suits you."
+
+
+# ── Subjects (per niche) ─────────────────────────────────────────────────────
+
+subjects:
+  technology:
+    - "Freelance developer available — [Your Name]"
+    - "Web development collaboration — [Your Name]"
+
+  saas:
+    - "Full-stack developer interested in contributing to {company}"
+    - "Developer available for SaaS projects — [Your Name]"
+
+  fintech:
+    - "Backend developer with fintech experience — [Your Name]"
+    - "Developer interested in {company}"
+
+  ecommerce:
+    - "Web developer available — [Your Name]"
+    - "Developer interested in contributing to {company}"
+
+  devtools:
+    - "Developer interested in {company}"
+    - "Software engineer available for developer tooling work"
+
+
+# ── Signature ─────────────────────────────────────────────────────────────────
+# Use literal \n for line breaks — do not use YAML block scalars here.
+
+signature: "Best regards,\n\n[Your Name]\n[your@email.com]\n[LinkedIn or portfolio URL]"

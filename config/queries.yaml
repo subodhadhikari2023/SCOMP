@@ -1,0 +1,47 @@
+# S.C.O.M.P — Search Query Bank
+#
+# Query philosophy:
+#   Describe the BUSINESS you want to find, not the skill or job title you offer.
+#   Pattern: [business type] + [size/stage] + [location/remote] + [contact intent]
+#   This causes the search engine to return company "about" and "contact" pages
+#   directly, not job boards or enterprise listings.
+#
+# Loaded and shuffled at runtime by scraper/discovery.py.
+# Queries are deduplicated against already-used ones before each new pass.
+#
+# To customise:
+#   1. Replace the example queries below with ones that match your target market.
+#   2. Add as many categories and queries as you like.
+#   3. Bump metadata.total to the actual count.
+#   4. Restart the container — no rebuild needed.
+
+metadata:
+  version: 1
+  total: 12
+  last_updated: "2025-01-01"
+
+queries:
+
+  # ── SaaS / Software Products ──────────────────────────────────────────────────
+  saas:
+    - bootstrapped SaaS startup contact founder
+    - indie SaaS product about team page
+    - small SaaS startup contact us hire
+
+  # ── Fintech ───────────────────────────────────────────────────────────────────
+  fintech:
+    - fintech startup small team contact
+    - payment platform startup about us
+    - early stage fintech company contact founder
+
+  # ── E-commerce ────────────────────────────────────────────────────────────────
+  ecommerce:
+    - small ecommerce startup contact page
+    - indie online store about team hire
+    - boutique ecommerce brand contact us
+
+  # ── Developer Tools ───────────────────────────────────────────────────────────
+  devtools:
+    - developer tools startup contact founder
+    - open source project company about us
+    - devtools startup small team contact
