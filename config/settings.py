@@ -4,9 +4,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-
 # ── SMTP ──────────────────────────────────────────────────────────────────────
 SMTP_ADDRESS: str  = os.getenv("SMTP_ADDRESS", "")
 DAILY_EMAIL_CAP: int = int(os.getenv("DAILY_EMAIL_CAP", "80"))

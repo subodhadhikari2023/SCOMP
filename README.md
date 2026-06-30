@@ -35,14 +35,20 @@ SCOMP/
 
 ### Option A — Pull from GHCR (no clone required)
 
-All you need is two files in an empty directory.
-
-**1. Get the compose file**
+**1. Download the compose file and default configs**
 
 ```bash
 mkdir scomp && cd scomp
+
 curl -O https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/docker-compose.yml
+
+mkdir config
+curl -o config/queries.yaml        https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/queries.yaml
+curl -o config/email_templates.yaml https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/email_templates.yaml
+curl -o config/targets.yaml        https://raw.githubusercontent.com/subodhadhikari2023/SCOMP/main/config/targets.yaml
 ```
+
+The config files are volume-mounted into the container, so you can edit them freely — no rebuild needed.
 
 **2. Create your `.env`**
 
@@ -112,7 +118,7 @@ docker compose run --rm scomp python main.py --send
 
 ### Option B — Build locally (for customisation)
 
-Clone the repo if you want to edit queries, templates, or selectors and rebuild:
+Clone the repo if you want to modify source code and rebuild the image:
 
 ```bash
 git clone https://github.com/subodhadhikari2023/SCOMP.git
@@ -123,11 +129,7 @@ docker compose build
 docker compose up
 ```
 
-To mount your local config so edits take effect without rebuilding, add this to the `volumes:` section of `docker-compose.yml`:
-
-```yaml
-- ./config:/app/config
-```
+Config files are already volume-mounted, so query and template edits take effect on the next `docker compose up` without a rebuild.
 
 ---
 

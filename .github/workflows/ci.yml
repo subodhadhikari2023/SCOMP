@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Check Python syntax
+        run: |
+          find . -name "*.py" \
+            ! -path "./.venv/*" \
+            ! -path "./__pycache__/*" \
+            -exec python -m py_compile {} +
+
+      - name: Validate YAML configs
+        run: |
+          python - <<'EOF'
+          import yaml, sys
+
+          files = [
+              "config/queries.yaml",
+              "config/email_templates.yaml",
+              "config/targets.yaml",
+          ]
+          for path in files:
+              try:
+                  with open(path) as f:
+                      yaml.safe_load(f)
+                  print(f"  ok  {path}")
+              except Exception as e:
+                  print(f"  FAIL  {path}: {e}")
+                  sys.exit(1)
+          EOF
