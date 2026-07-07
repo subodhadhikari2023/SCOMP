@@ -7,6 +7,10 @@ A self-contained Python CLI automation framework for personalised cold email out
 
 ---
 
+## Highlight
+
+Dockerized and published to GHCR — zero paid APIs.
+
 ## Architecture
 
 ```
