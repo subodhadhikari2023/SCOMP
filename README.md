@@ -257,4 +257,9 @@ Opens a headed browser — log in once and handle any MFA. Session persists for 
 - pyyaml
 - python-dotenv
 - Docker
+- Docker Compose
+- Linux
+- Bash
+- Flask
+- VS Code
 
