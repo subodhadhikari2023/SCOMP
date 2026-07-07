@@ -7,6 +7,10 @@ A self-contained Python CLI automation framework for personalised cold email out
 
 ---
 
+## Highlight
+
+Dockerized and published to GHCR — zero paid APIs.
+
 ## Architecture
 
 ```
@@ -242,4 +246,15 @@ Opens a headed browser — log in once and handle any MFA. Session persists for 
 
 ## Tech Stack
 
-Python 3.14 · httpx · BeautifulSoup4 · Playwright (Firefox) · SQLite · Rich · pyyaml · python-dotenv · Docker
+![Python](https://img.shields.io/badge/Python_3.14-3776AB?style=for-the-badge&logo=python&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white) ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+
+- Python 3.14
+- httpx
+- BeautifulSoup4
+- Playwright (Firefox)
+- SQLite
+- Rich
+- pyyaml
+- python-dotenv
+- Docker
+
